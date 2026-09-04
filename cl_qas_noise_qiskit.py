@@ -2627,6 +2627,7 @@ def run_seed(tasks, seed):
                         ]
                     )
                 ),
+
                 "vqc_transpiled_n1":
                 float(
                     np.mean(
