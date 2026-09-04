@@ -12,3 +12,12 @@ python cl_qas_ecg.py
 
 #### 2. Simulating experiments of CL-QAS for Financial Time-Series Prediction
 python cl_qas_finance.py
+
+#### 3. Ablation study of CL-QAS for ECG Signal Classification
+python cl_qas_ablation.py
+
+#### 4. Simulating CL-QAS for ECG Signal Classification with controlled quantum noise
+python cl_qas_ecg_controlled_noise.py
+
+#### 5. Simulating CL-QAS for ECG Signal Classification with Qiskit realistic noise
+python cl_qas_ecg_qiskit.py
