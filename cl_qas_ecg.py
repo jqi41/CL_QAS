@@ -1,907 +1,3967 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-CL-QAS on MIT-BIH ECG (N vs V) with ablation:
-  - naive-vqc (fixed hand-crafted circuit, TT-encoding)
-  - qas-no-cl  (policy search without EWC / replay, TT-encoding)
-  - cl-qas     (policy search with EWC + replay, TT-encoding)
-  - cl-qas-no-tt (ablation: CL-QAS without TT-encoding)
+clqas_ecg_table1_aligned_with_table3.py
 
-High-dim input (256):
-- num_qubits = 12
-- Input features per beat: 256-sample vector
-- TT-encoding maps 256-D -> 12 angles with in_modes=(4,16,4), out_modes=(3,2,2), ranks=(1,2,3,1)
-- QASPolicy adapts 256-D features to per-qubit tokens; circuits use ring+extra CZ if policy picks CZ
+Main ECG experiment for Table 1, aligned exactly with the experimental
+protocol used for the revised Table 3 ablation study.
 
-NoiseModel supports simple scaling approximations for depolarizing and readout errors; set p=0 for noiseless.
+Compared methods
+----------------
+1. Naive-VQC
+2. QAS-No-CL
+3. CL-QAS
 
-Outputs:
-- Per-task metrics for all methods
-- Mean±Std summaries
-- Runtime per task for QAS methods; CL-QAS vs CL-QAS-no-TT ablation includes runtime
+Alignment with Table 3
+----------------------
+For a given random seed, all methods use exactly the same:
 
-Dependencies:
-  pip install wfdb torch numpy scikit-learn torchquantum
+    - MIT-BIH records
+    - ECG preprocessing
+    - train / validation / test samples
+    - train-only standardization
+    - TT rank r = 3
+    - TT tensorization (4, 16, 4)
+    - amplitude encoding
+    - VQC implementation
+    - architecture search space
+    - search budget
+    - VQC optimization budget
+    - hardware-aware reward
+    - final 90/10 evaluation protocol
+    - pooled ECG metric computation
+
+The only methodological differences are:
+
+    Naive-VQC:
+        fixed depth-4 ring architecture
+
+    QAS-No-CL:
+        architecture search without EWC/KL
+
+    CL-QAS:
+        architecture search with EWC + KL policy preservation
+
+Important statistical protocol
+------------------------------
+For each seed:
+
+    1. Each MIT-BIH record is treated as one sequential task.
+    2. Each task is split into:
+           80% search-training
+           10% architecture-validation
+           10% untouched testing
+    3. QAS uses only the 80/10 search split.
+    4. After architecture selection, the selected architecture is
+       reinitialized and trained from scratch on train + validation = 90%.
+    5. Predictions from all eight held-out ECG record test sets are pooled.
+    6. Accuracy, balanced accuracy, and F1 are computed once per seed.
+    7. Table 1 reports mean +/- standard deviation across seeds.
+
+This is the same evaluation logic used by the revised Table 3 code.
+
+Dependencies
+------------
+pip install torch numpy pandas scikit-learn wfdb certifi
 """
 
+# ============================================================
+# Imports
+# ============================================================
+
+import os
 import time
+import copy
 import random
-import numpy as np
+
 from dataclasses import dataclass
-from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-import torchquantum as tq
-from sklearn.metrics import confusion_matrix, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+)
+
+
+# ============================================================
+# WFDB / SSL support
+# ============================================================
+
+try:
+    import certifi
+
+    os.environ.setdefault(
+        "SSL_CERT_FILE",
+        certifi.where(),
+    )
+
+    os.environ.setdefault(
+        "REQUESTS_CA_BUNDLE",
+        certifi.where(),
+    )
+
+except ImportError:
+    pass
+
 
 try:
     import wfdb
-except Exception as e:
-    raise ImportError("Please install wfdb: pip install wfdb") from e
+
+except ImportError as exc:
+
+    raise ImportError(
+        "Please install dependencies with:\n"
+        "pip install wfdb certifi"
+    ) from exc
 
 
-# ----------------------------- Repro
-def set_seed(seed=1234):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+# ============================================================
+# 1. Configuration
+# ============================================================
+
+DEVICE = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+REAL = torch.float32
+
+COMPLEX = torch.complex64
+
+
+# ------------------------------------------------------------
+# Dataset
+# ------------------------------------------------------------
+
+MITDB_VERSION = "1.0.0"
+
+MITDB_LOCAL_DIR = os.path.expanduser(
+    "~/Documents/Projects/qnn/data/mitdb"
+)
+
+ECG_RECORDS = (
+    105,
+    106,
+    109,
+    114,
+    116,
+    119,
+    200,
+    201,
+)
+
+MAX_BEATS_PER_RECORD = 800
+
+ECG_WINDOW_SEC = 0.6
+
+INPUT_DIM = 256
+
+
+# ------------------------------------------------------------
+# AAMI binary classes
+# ------------------------------------------------------------
+
+AAMI_N = {
+    "N",
+    "L",
+    "R",
+    "e",
+    "j",
+}
+
+AAMI_V = {
+    "V",
+    "E",
+}
+
+
+# ------------------------------------------------------------
+# Quantum representation
+# ------------------------------------------------------------
+
+NUM_QUBITS = 8
+
+NUM_CLASSES = 2
+
+TT_MODES = (
+    4,
+    16,
+    4,
+)
+
+TT_RANK = 3
+
+
+# ------------------------------------------------------------
+# Architecture search
+#
+# SAME as Table 3
+# ------------------------------------------------------------
+
+DEPTH_CHOICES = (
+    2,
+    3,
+    4,
+)
+
+ENT_PATTERNS = (
+    "ring",
+    "linear",
+    "brick_even",
+    "brick_odd",
+)
+
+
+SEARCH_STEPS = 10
+
+CANDIDATES_PER_STEP = 3
+
+SEARCH_INNER_EPOCHS = 8
+
+
+# ------------------------------------------------------------
+# Final refit
+# ------------------------------------------------------------
+
+FINAL_REFIT_EPOCHS = 40
+
+BATCH_SIZE = 64
+
+
+# ------------------------------------------------------------
+# Optimization
+# ------------------------------------------------------------
+
+VQC_LR = 3e-3
+
+POLICY_LR = 1e-3
+
+WEIGHT_DECAY = 1e-5
+
+
+# ------------------------------------------------------------
+# Continual regularization
+# ------------------------------------------------------------
+
+MU_EWC = 0.5
+
+ETA_KL = 0.01
+
+ENTROPY_COEF = 0.002
+
+
+# ------------------------------------------------------------
+# Hardware-aware reward
+# ------------------------------------------------------------
+
+LAMBDA_HW = 0.01
+
+
+# ------------------------------------------------------------
+# Table-3-consistent data split
+# ------------------------------------------------------------
+
+SEARCH_TRAIN_FRAC = 0.80
+
+SEARCH_VAL_FRAC = 0.10
+
+# Remaining 10% = test
+
+SPLIT_SEED_BASE = 5000
+
+
+# ------------------------------------------------------------
+# SAME seeds as Table 3
+# ------------------------------------------------------------
+
+SEEDS = (
+    11,
+    22,
+    33,
+)
+
+
+# ============================================================
+# 2. Reproducibility
+# ============================================================
+
+def set_seed(
+    seed: int,
+) -> None:
+
+    random.seed(
+        seed
+    )
+
+    np.random.seed(
+        seed
+    )
+
+    torch.manual_seed(
+        seed
+    )
+
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-set_seed(1234)
+
+        torch.cuda.manual_seed_all(
+            seed
+        )
 
 
-# ----------------------------- MIT-BIH helpers
-AAMI_N = set(['N', 'L', 'R', 'e', 'j'])
-AAMI_V = set(['V', 'E'])
+# ============================================================
+# 3. Robust MIT-BIH loading
+# ============================================================
 
-def map_symbol_to_binary(sym):
-    if sym in AAMI_N: return 0
-    if sym in AAMI_V: return 1
+def read_mitdb_record(
+    record,
+    max_retries=5,
+    retry_wait=3.0,
+):
+
+    record = str(
+        record
+    )
+
+    # --------------------------------------------------------
+    # Local database first
+    # --------------------------------------------------------
+
+    if os.path.isdir(
+        MITDB_LOCAL_DIR
+    ):
+
+        record_base = os.path.join(
+            MITDB_LOCAL_DIR,
+            record,
+        )
+
+        required_files = (
+            record_base + ".hea",
+            record_base + ".dat",
+            record_base + ".atr",
+        )
+
+        if all(
+            os.path.exists(path)
+            for path in required_files
+        ):
+
+            try:
+
+                signal, fields = wfdb.rdsamp(
+                    record_base
+                )
+
+                annotation = wfdb.rdann(
+                    record_base,
+                    "atr",
+                )
+
+                print(
+                    f"[MIT-BIH] Record {record} "
+                    f"loaded locally."
+                )
+
+                return (
+                    signal,
+                    fields,
+                    annotation,
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"[MIT-BIH] Local read failed "
+                    f"for {record}: {exc}"
+                )
+
+
+    # --------------------------------------------------------
+    # PhysioNet fallback
+    # --------------------------------------------------------
+
+    pn_dir = (
+        f"mitdb/{MITDB_VERSION}"
+    )
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        max_retries + 1,
+    ):
+
+        try:
+
+            print(
+                f"[MIT-BIH] Fetching {record} "
+                f"from PhysioNet "
+                f"({attempt}/{max_retries})"
+            )
+
+            signal, fields = wfdb.rdsamp(
+                record,
+                pn_dir=pn_dir,
+            )
+
+            annotation = wfdb.rdann(
+                record,
+                "atr",
+                pn_dir=pn_dir,
+            )
+
+            return (
+                signal,
+                fields,
+                annotation,
+            )
+
+        except Exception as exc:
+
+            last_error = exc
+
+            print(
+                f"    failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            if attempt < max_retries:
+
+                time.sleep(
+                    retry_wait
+                    * attempt
+                )
+
+    raise RuntimeError(
+        f"Unable to load MIT-BIH "
+        f"record {record}.\n"
+        f"Last error: {last_error}"
+    )
+
+
+# ============================================================
+# 4. ECG preprocessing
+# ============================================================
+
+def map_symbol_to_binary(
+    symbol: str,
+) -> Optional[int]:
+
+    if symbol in AAMI_N:
+        return 0
+
+    if symbol in AAMI_V:
+        return 1
+
     return None
 
-def pick_single_channel(sig_names):
-    names_upper = [s.upper() for s in sig_names]
-    return names_upper.index('MLII') if 'MLII' in names_upper else 0
 
-def bandpass(signal, fs=360.0, low=0.5, high=40.0):
-    n = len(signal)
-    freqs = np.fft.rfftfreq(n, d=1.0/fs)
-    fftx = np.fft.rfft(signal)
-    mask = (freqs >= low) & (freqs <= high)
-    fftx *= mask
-    return np.fft.irfft(fftx, n=n)
+def choose_channel(
+    signal_names: List[str],
+) -> int:
 
-# ---------- High-dimensional (256) beat vector ----------
-def beat_vector_256(segment, target_len=256):
-    """
-    Convert a beat segment to a 256-dim vector:
-      1) linear resample to target_len
-      2) per-beat z-normalize
-      3) clip to 5 stds
-    """
-    x = np.asarray(segment, dtype=np.float32)
-    src_t = np.linspace(0.0, 1.0, num=len(x), endpoint=False, dtype=np.float32)
-    dst_t = np.linspace(0.0, 1.0, num=target_len, endpoint=False, dtype=np.float32)
-    xr = np.interp(dst_t, src_t, x).astype(np.float32)
-    mu, sd = float(xr.mean()), float(xr.std() + 1e-6)
-    xr = (xr - mu) / sd
-    xr = np.clip(xr, -5.0, 5.0)
-    return xr.astype(np.float32)
+    names = [
+        name.upper()
+        for name in signal_names
+    ]
 
-def extract_record_dataset(record, max_beats=800, window_sec=0.6, min_per_class=10):
-    """
-    For a record, extract beats around annotations (N/V only), producing:
-      X: (n_beats, 256)  y: (n_beats,)
-    """
-    rec = f"{record}"
-    sig, fields = wfdb.rdsamp(rec, pn_dir='mitdb', sampto=None)
-    ann = wfdb.rdann(rec, 'atr', pn_dir='mitdb')
-    ch_idx = pick_single_channel(fields['sig_name'])
-    x = sig[:, ch_idx]
-    fs = fields['fs']
-    x = bandpass(x, fs=fs, low=0.5, high=40.0)
+    if "MLII" in names:
 
-    half = int(window_sec * fs)
-    X, y = [], []
-    for samp, sym in zip(ann.sample, ann.symbol):
-        label = map_symbol_to_binary(sym)
+        return names.index(
+            "MLII"
+        )
+
+    return 0
+
+
+def fft_bandpass(
+    signal: np.ndarray,
+    fs: float,
+    low: float = 0.5,
+    high: float = 40.0,
+) -> np.ndarray:
+
+    n = len(
+        signal
+    )
+
+    frequencies = np.fft.rfftfreq(
+        n,
+        d=1.0 / fs,
+    )
+
+    spectrum = np.fft.rfft(
+        signal
+    )
+
+    mask = (
+        (frequencies >= low)
+        &
+        (frequencies <= high)
+    )
+
+    spectrum *= mask
+
+    output = np.fft.irfft(
+        spectrum,
+        n=n,
+    )
+
+    return output.astype(
+        np.float32
+    )
+
+
+def beat_vector_256(
+    segment: np.ndarray,
+    target_len: int = INPUT_DIM,
+) -> np.ndarray:
+
+    x = np.asarray(
+        segment,
+        dtype=np.float32,
+    )
+
+    source_grid = np.linspace(
+        0.0,
+        1.0,
+        len(x),
+        endpoint=False,
+        dtype=np.float32,
+    )
+
+    target_grid = np.linspace(
+        0.0,
+        1.0,
+        target_len,
+        endpoint=False,
+        dtype=np.float32,
+    )
+
+    x = np.interp(
+        target_grid,
+        source_grid,
+        x,
+    ).astype(
+        np.float32
+    )
+
+    # Per-beat normalization.
+    mean = float(
+        x.mean()
+    )
+
+    std = float(
+        x.std()
+        + 1e-6
+    )
+
+    x = (
+        x - mean
+    ) / std
+
+    x = np.clip(
+        x,
+        -5.0,
+        5.0,
+    )
+
+    return x.astype(
+        np.float32
+    )
+
+
+def load_record(
+    record,
+    max_beats=MAX_BEATS_PER_RECORD,
+    window_sec=ECG_WINDOW_SEC,
+    min_per_class=10,
+):
+
+    (
+        signal,
+        fields,
+        annotation,
+    ) = read_mitdb_record(
+        record
+    )
+
+    channel = choose_channel(
+        fields["sig_name"]
+    )
+
+    fs = float(
+        fields["fs"]
+    )
+
+    x = signal[
+        :,
+        channel
+    ]
+
+    x = fft_bandpass(
+        x,
+        fs,
+    )
+
+    half_window = int(
+        window_sec
+        * fs
+    )
+
+    X = []
+
+    y = []
+
+    for (
+        sample,
+        symbol,
+    ) in zip(
+        annotation.sample,
+        annotation.symbol,
+    ):
+
+        label = map_symbol_to_binary(
+            symbol
+        )
+
         if label is None:
             continue
-        start, end = samp - half, samp + half
-        if start < 0 or end >= len(x):
+
+        start = (
+            sample
+            - half_window
+        )
+
+        end = (
+            sample
+            + half_window
+        )
+
+        if (
+            start < 0
+            or end >= len(x)
+        ):
             continue
-        seg = x[start:end]
-        feats = beat_vector_256(seg, target_len=256)
-        X.append(feats); y.append(label)
-        if len(X) >= max_beats:
+
+        X.append(
+            beat_vector_256(
+                x[
+                    start:end
+                ]
+            )
+        )
+
+        y.append(
+            label
+        )
+
+        if (
+            max_beats is not None
+            and len(X) >= max_beats
+        ):
             break
 
-    if len(X) == 0:
-        raise RuntimeError(f"No usable beats for record {record} (N/V only).")
-    X = np.stack(X).astype(np.float32)
-    y = np.array(y, dtype=np.int64)
+    if not X:
 
-    cls_counts = np.bincount(y, minlength=2)
-    if (cls_counts[0] < min_per_class) or (cls_counts[1] < min_per_class):
-        raise RuntimeError(f"Record {record}: insufficient class counts {cls_counts.tolist()}")
-
-    mu = X.mean(axis=0, keepdims=True)
-    sd = X.std(axis=0, keepdims=True) + 1e-6
-    X = (X - mu) / sd
-
-    return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
-
-
-# ----------------------------- Stratified split utilities
-def stratified_split_indices(y, train_ratio=0.8, seed=1234):
-    rng = np.random.RandomState(seed)
-    y_np = y.cpu().numpy()
-    idx_pos = np.where(y_np == 1)[0].tolist()
-    idx_neg = np.where(y_np == 0)[0].tolist()
-    rng.shuffle(idx_pos); rng.shuffle(idx_neg)
-    ntr_pos = int(train_ratio * len(idx_pos))
-    ntr_neg = int(train_ratio * len(idx_neg))
-    tr = idx_pos[:ntr_pos] + idx_neg[:ntr_neg]
-    te = idx_pos[ntr_pos:] + idx_neg[ntr_neg:]
-    rng.shuffle(tr); rng.shuffle(te)
-    return torch.tensor(tr, dtype=torch.long), torch.tensor(te, dtype=torch.long)
-
-def stratified_subsplit_indices(y, base_indices, sub_train_ratio=0.85, seed=1234):
-    sub_y = y[base_indices]
-    pos = base_indices[(sub_y == 1).nonzero(as_tuple=True)[0]]
-    neg = base_indices[(sub_y == 0).nonzero(as_tuple=True)[0]]
-    if len(pos) > 0:
-        pos = pos[torch.randperm(len(pos))]
-    if len(neg) > 0:
-        neg = neg[torch.randperm(len(neg))]
-    ntr_pos = int(sub_train_ratio * len(pos))
-    ntr_neg = int(sub_train_ratio * len(neg))
-    tr = torch.cat([pos[:ntr_pos], neg[:ntr_neg]], dim=0)
-    va = torch.cat([pos[ntr_pos:], neg[ntr_neg:]], dim=0)
-    if len(tr) > 0: tr = tr[torch.randperm(len(tr))]
-    if len(va) > 0: va = va[torch.randperm(len(va))]
-    return tr, va
-
-
-# ----------------------------- Replay buffer (CL only)
-class ReplayBuffer:
-    def __init__(self, per_class_cap=500):
-        self.data = {0: [], 1: []}
-        self.cap = per_class_cap
-
-    def add(self, X, y, take_per_class=80):
-        for c in [0, 1]:
-            idx = (y == c).nonzero(as_tuple=True)[0]
-            if len(idx) == 0: continue
-            sel = idx[torch.randperm(len(idx))[:min(len(idx), take_per_class)]]
-            feats = X[sel].cpu()
-            labs = y[sel].cpu()
-            self.data[c].extend(list(zip(feats, labs)))
-            if len(self.data[c]) > self.cap:
-                self.data[c] = self.data[c][-self.cap:]
-
-    def sample_missing_class(self, missing_class, n=80):
-        pool = self.data.get(missing_class, [])
-        if not pool:
-            return None, None
-        take = min(n, len(pool))
-        import random as pyrand
-        sel = pyrand.sample(pool, take)
-        feats = torch.stack([t[0] for t in sel])
-        labs = torch.stack([t[1] for t in sel])
-        return feats, labs
-
-
-# ----------------------------- Policy (feature-adaptive per-qubit tokens)
-class QASPolicy(nn.Module):
-    """
-    Takes B x fea_dim inputs and produces per-qubit action logits (B, num_qubits, 4).
-    Internally adapts feature vectors to num_qubits tokens, then applies a Transformer.
-    """
-    def __init__(self, num_qubits=12, fea_dim=256, d_model=48, nhead=6, num_layers=2):
-        super().__init__()
-        self.num_qubits = num_qubits
-        self.fea_dim = fea_dim
-        self.adapt = nn.Linear(fea_dim, num_qubits)
-        self.token_embed = nn.Linear(1, d_model)
-        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.pos = nn.Parameter(torch.randn(1, num_qubits, d_model) * 0.02)
-        self.head = nn.Linear(d_model, 4)  # RX, RY, RZ, CZ
-
-    def forward(self, x):
-        tok = self.adapt(x).unsqueeze(-1)        # (B, Q, 1)
-        h = self.token_embed(tok)                # (B, Q, d_model)
-        h = self.encoder(h + self.pos)
-        return self.head(h)                      # (B, Q, 4)
-
-
-# ============================= TT-ENCODING MODULES =============================
-class TTMatrix(nn.Module):
-    """
-    Tensor-Train matrix mapping:
-      R^{prod(n_k)} -> R^{prod(m_k)} with cores in R^{r_{k-1} x n_k x m_k x r_k}
-    """
-    def __init__(self, in_modes, out_modes, tt_ranks):
-        super().__init__()
-        assert len(in_modes) == len(out_modes), "in_modes and out_modes must have same length"
-        self.in_modes  = list(in_modes)
-        self.out_modes = list(out_modes)
-        self.d = len(in_modes)
-        assert tt_ranks[0] == 1 and tt_ranks[-1] == 1, "tt_ranks must start and end with 1"
-        assert len(tt_ranks) == self.d + 1, "len(tt_ranks) must be d+1"
-        self.tt_ranks = list(tt_ranks)
-        cores = []
-        for k in range(self.d):
-            r0, r1 = self.tt_ranks[k], self.tt_ranks[k+1]
-            nk, mk = self.in_modes[k], self.out_modes[k]
-            G = nn.Parameter(0.02 * torch.randn(r0, nk, mk, r1))
-            cores.append(G)
-        self.cores = nn.ParameterList(cores)
-
-    @property
-    def in_features(self):
-        return int(np.prod(self.in_modes))
-
-    @property
-    def out_features(self):
-        return int(np.prod(self.out_modes))
-
-    def forward(self, x):
-        B = x.shape[0]
-        y = x.view(B, *self.in_modes)  # (B, n1,...,nd)
-        left = y.unsqueeze(1)          # (B, 1, n1, ..., nd)
-        r_prev = 1
-        for k in range(self.d):
-            G = self.cores[k]  # (r_{k-1}, n_k, m_k, r_k)
-            nk, mk = self.in_modes[k], self.out_modes[k]
-            left = left.contiguous().view(B, r_prev, nk, -1)  # (B, r_prev, nk, R)
-            R = left.shape[-1]
-            left_flat = left.view(B, r_prev*nk, R)
-            core_flat = G.view(r_prev*nk, mk*self.tt_ranks[k+1])
-            out = torch.matmul(left_flat.transpose(1,2), core_flat)   # (B, R, mk*r_k)
-            out = out.view(B, R, mk, self.tt_ranks[k+1]).transpose(1,3)  # (B, r_k, mk, R)
-            left = out
-            r_prev = self.tt_ranks[k+1]
-        left = left.squeeze(1)          # (B, mk, R_final)
-        left = left.contiguous().view(B, -1)
-        return left.view(B, self.out_features)
-
-
-class TTEncoder(nn.Module):
-    """
-    TT layer to produce per-qubit angles. Here: 256 -> 12.
-    Modes: in=(4,16,4) [=256], out=(3,2,2) [=12], ranks=(1,2,3,1).
-    """
-    def __init__(
-        self,
-        in_dim=256,
-        out_dim=12,
-        in_modes=(4,16,4),
-        out_modes=(3,2,2),
-        tt_ranks=(1,2,3,1),
-        angle_scale=np.pi,
-        post_norm=True
-    ):
-        super().__init__()
-        assert int(np.prod(in_modes)) == in_dim, "in_modes must multiply to in_dim"
-        assert int(np.prod(out_modes)) == out_dim, "out_modes must multiply to out_dim"
-        self.tt = TTMatrix(in_modes, out_modes, tt_ranks)
-        self.post_norm = nn.LayerNorm(out_dim) if post_norm else nn.Identity()
-        self.angle_scale = float(angle_scale)
-
-    def forward(self, x):
-        y = self.tt(x)                    # (B, out_dim)
-        y = self.post_norm(y)
-        angles = torch.tanh(y) * self.angle_scale
-        return angles
-
-
-# ----------------------------- Noise model (fast expectation scaling)
-@dataclass
-class NoiseModel:
-    p_depol_1q: float = 0.00
-    p_depol_2q: float = 0.00
-    p_readout:  float = 0.00
-    encoder_jitter_sigma: float = 0.00  # radians, training-time jitter
-
-    def clamp_(self):
-        self.p_depol_1q = float(np.clip(self.p_depol_1q, 0.0, 1.0))
-        self.p_depol_2q = float(np.clip(self.p_depol_2q, 0.0, 1.0))
-        self.p_readout  = float(np.clip(self.p_readout,  0.0, 0.5))
-        self.encoder_jitter_sigma = max(0.0, float(self.encoder_jitter_sigma))
-        return self
-
-
-# ----------------------------- QNN builder & classifier
-def _count_gates(actions, num_qubits, depth):
-    actions = actions.detach().cpu()
-    oneq_per_layer = int((actions != 3).sum().item())  # RX/RY/RZ
-    cz_per_layer = int((actions == 3).sum().item())
-    ring_extra = 1 if (num_qubits > 2 and actions[-1].item() == 3) else 0
-    cz_per_layer += ring_extra
-    oneq_encoding = num_qubits
-    n1 = depth * oneq_per_layer + oneq_encoding
-    n2 = depth * cz_per_layer
-    return n1, n2, oneq_encoding, oneq_per_layer, cz_per_layer
-
-
-def build_qnn_from_actions(actions, num_qubits=12, depth=2):
-    class GeneratedQNN(tq.QuantumModule):
-        def __init__(self):
-            super().__init__()
-            self.num_qubits = num_qubits
-            self.depth = depth
-            self.actions = actions.detach().cpu().tolist()
-
-        def _encode(self, qdev, angles):
-            for i in range(self.num_qubits):
-                tq.RY(has_params=False)(qdev, wires=i, params=angles[:, i])
-
-        def _layer(self, qdev):
-            for i, a in enumerate(self.actions):
-                if a == 0: tq.RX(has_params=True, trainable=True, init_params=0.05)(qdev, wires=i)
-                elif a == 1: tq.RY(has_params=True, trainable=True, init_params=0.05)(qdev, wires=i)
-                elif a == 2: tq.RZ(has_params=True, trainable=True, init_params=0.05)(qdev, wires=i)
-            for i, a in enumerate(self.actions):
-                if a == 3 and i < self.num_qubits - 1:
-                    tq.CZ()(qdev, wires=[i, i + 1])
-            if self.num_qubits > 2 and self.actions[-1] == 3:
-                tq.CZ()(qdev, wires=[self.num_qubits - 1, 0])
-
-        def forward(self, qdev, angles):
-            self._encode(qdev, angles)
-            for _ in range(self.depth):
-                self._layer(qdev)
-
-    qlayer = GeneratedQNN()
-    n1, n2, n_enc, n1_per_layer, n2_per_layer = _count_gates(actions, num_qubits, depth)
-    gate_stats = {
-        "n1_total": n1, "n2_total": n2, "n1_encoding": n_enc,
-        "n1_per_layer": n1_per_layer, "n2_per_layer": n2_per_layer,
-        "depth": depth, "num_qubits": num_qubits,
-    }
-    return qlayer, gate_stats
-
-
-class QNNClassifier(nn.Module):
-    def __init__(
-        self,
-        qlayer: tq.QuantumModule,
-        gate_stats: dict,
-        num_qubits=12,
-        num_classes=2,
-        fea_dim=256,
-        use_tt_encoding=True,
-        tt_in_modes=(4,16,4),
-        tt_out_modes=(3,2,2),
-        tt_ranks=(1,2,3,1),
-        angle_scale=np.pi,
-        noise: NoiseModel = NoiseModel(),
-    ):
-        super().__init__()
-        self.num_qubits = num_qubits
-        self.use_tt = use_tt_encoding
-        self.gate_stats = gate_stats
-        self.noise = noise.clamp_()
-
-        self.pre = nn.Sequential(
-            nn.LayerNorm(fea_dim),
-            nn.Linear(fea_dim, fea_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+        raise RuntimeError(
+            f"No usable beats "
+            f"for record {record}."
         )
 
-        if self.use_tt:
-            self.tt_enc = TTEncoder(
-                in_dim=fea_dim,
-                out_dim=num_qubits,
-                in_modes=tt_in_modes,
-                out_modes=tt_out_modes,
-                tt_ranks=tt_ranks,
-                angle_scale=angle_scale,
-                post_norm=True
+    X = np.stack(
+        X
+    ).astype(
+        np.float32
+    )
+
+    y = np.asarray(
+        y,
+        dtype=np.int64,
+    )
+
+    counts = np.bincount(
+        y,
+        minlength=2,
+    )
+
+    if (
+        counts[0] < min_per_class
+        or counts[1] < min_per_class
+    ):
+
+        raise RuntimeError(
+            f"Record {record}: "
+            f"insufficient class counts "
+            f"{counts.tolist()}."
+        )
+
+    return (
+        torch.tensor(
+            X,
+            dtype=REAL,
+        ),
+        torch.tensor(
+            y,
+            dtype=torch.long,
+        ),
+    )
+
+
+def load_tasks():
+
+    tasks = []
+
+    for record in ECG_RECORDS:
+
+        X, y = load_record(
+            record
+        )
+
+        counts = torch.bincount(
+            y,
+            minlength=2,
+        )
+
+        print(
+            f"Record {record}: "
+            f"N={counts[0].item()}, "
+            f"V={counts[1].item()}, "
+            f"total={len(y)}"
+        )
+
+        tasks.append(
+            (
+                record,
+                X,
+                y,
             )
-            self.proj = None
-        else:
-            self.tt_enc = None
-            # lightweight projection to 12 angles if input dim != num_qubits
-            self.proj = nn.Linear(fea_dim, num_qubits) if fea_dim != num_qubits else None
+        )
 
-        self.q_layer = qlayer
-        self.measure = tq.MeasureAll(tq.PauliZ)
-        self.fc = nn.Linear(num_qubits, num_classes)
-
-    def forward(self, x):
-        x = self.pre(x)
-        if self.use_tt and self.tt_enc is not None:
-            angles = self.tt_enc(x)              # (B, num_qubits) in radians
-        else:
-            angles = torch.tanh(x)               # [-1,1]
-            if self.proj is not None:
-                angles = self.proj(angles)
-            angles = torch.tanh(angles) * np.pi  # [-pi, pi]
-
-        # Encoder jitter during training
-        if self.noise.encoder_jitter_sigma > 0.0 and self.training:
-            angles = angles + torch.randn_like(angles) * self.noise.encoder_jitter_sigma
-
-        bsz = x.shape[0]
-        qdev = tq.QuantumDevice(n_wires=self.fc.in_features, bsz=bsz, device=x.device)
-        self.q_layer(qdev, angles)
-        z_true = self.measure(qdev)  # (B, num_qubits)
-
-        # Fast depolarizing scaling
-        n1 = self.gate_stats["n1_total"]
-        n2 = self.gate_stats["n2_total"]
-        a1 = (1.0 - self.noise.p_depol_1q) ** max(0, n1)
-        a2 = (1.0 - self.noise.p_depol_2q) ** max(0, n2)
-        z_noisy = z_true * (a1 * a2)
-
-        # Readout symmetric flip
-        if self.noise.p_readout > 0.0:
-            z_noisy = z_noisy * (1.0 - 2.0 * self.noise.p_readout)
-
-        return self.fc(z_noisy)
+    return tasks
 
 
-# ----------------------------- EWC (for CL)
-class EWCLoss:
-    def __init__(self, model: nn.Module, dataloader, device='cpu', lambda_ewc=60.0):
-        self.model = model
-        self.device = device
-        self.lambda_ewc = lambda_ewc
-        self.params = {n: p.clone().detach() for n, p in model.named_parameters()}
-        self.fisher = self._compute_fisher(dataloader)
+# ============================================================
+# 5. EXACT SAME split protocol as Table 3
+# ============================================================
 
-    def _compute_fisher(self, dataloader):
-        fim = {n: torch.zeros_like(p, device=self.device) for n, p in self.model.named_parameters()}
-        self.model.eval()
-        for xb, _ in dataloader:
-            xb = xb.to(self.device)
-            self.model.zero_grad()
-            logits = self.model(xb)
-            if logits.dim() == 3:  # policy-like
-                probs = torch.softmax(logits, dim=-1)
-                pm = probs.mean(dim=0)
-                dists = [torch.distributions.Categorical(pm[q]) for q in range(pm.size(0))]
-                actions = torch.stack([d.sample() for d in dists])
-                logp = sum(d.log_prob(a) for d, a in zip(dists, actions))
-                (-logp).backward()
-            else:
-                dummy_y = torch.randint(0, logits.size(-1), (logits.size(0),), device=logits.device)
-                nn.functional.cross_entropy(logits, dummy_y).backward()
-            for n, p in self.model.named_parameters():
-                if p.grad is not None:
-                    fim[n] += (p.grad.detach() ** 2) / len(dataloader)
-        return fim
+def stratified_split_table3(
+    y: torch.Tensor,
+    train_frac: float = SEARCH_TRAIN_FRAC,
+    val_frac: float = SEARCH_VAL_FRAC,
+    seed: int = 1234,
+):
 
-    def penalty(self, model):
-        loss = 0.0
-        for n, p in model.named_parameters():
-            loss = loss + (self.fisher[n] * (p - self.params[n])**2).sum()
-        return self.lambda_ewc * loss
-
-
-# ----------------------------- Losses, metrics, sampler
-def make_class_weighted_ce(y, device, n_classes=2):
-    counts = torch.bincount(y, minlength=n_classes).float()
-    counts[counts == 0] = 1.0
-    weights = 1.0 / counts
-    weights = weights / weights.sum() * n_classes
-    return nn.CrossEntropyLoss(weight=weights.to(device)), weights
-
-class FocalLoss(nn.Module):
-    def __init__(self, weight=None, gamma=2.0):
-        super().__init__()
-        self.weight = weight
-        self.gamma = gamma
-    def forward(self, logits, y):
-        ce = nn.functional.cross_entropy(logits, y, weight=self.weight, reduction='none')
-        p = torch.softmax(logits, dim=1).gather(1, y.unsqueeze(1)).squeeze(1).clamp_(1e-6, 1-1e-6)
-        mod = (1 - p) ** self.gamma
-        return (mod * ce).mean()
-
-def maybe_make_sampler(y, n_classes=2):
-    counts = torch.bincount(y, minlength=n_classes).float()
-    if (counts > 0).sum() < 2:
-        return None
-    class_weights = 1.0 / (counts + 1e-6)
-    sample_weights = class_weights[y]
-    return WeightedRandomSampler(weights=sample_weights, num_samples=len(y), replacement=True)
-
-def compute_metrics(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
-    acc = (np.trace(cm) / np.sum(cm)) if cm.size else 0.0
-    with numpy_errstate():
-        tpr0 = cm[0,0] / max(1, cm[0].sum())
-        tpr1 = cm[1,1] / max(1, cm[1].sum())
-        bacc = 0.5 * (tpr0 + tpr1)
-    f1 = f1_score(y_true, y_pred, average='binary', zero_division=0)
-    return cm, acc, bacc, f1
-
-@contextmanager
-def numpy_errstate():
-    with np.errstate(divide='ignore', invalid='ignore'):
-        yield
-
-
-# ----------------------------- Policy helpers
-def apply_cz_prior(pm, max_expected_cz=0.30, scale=0.5, eps=1e-8):
-    expected_cz = pm[:, 3].mean()
-    if expected_cz.detach().item() > max_expected_cz:
-        pm = pm.clone()
-        pm[:, 3] = pm[:, 3] * scale
-        pm = pm / (pm.sum(dim=-1, keepdim=True) + eps)
-    return pm
-
-def greedy_actions_from_policy(policy, x_batch):
-    with torch.no_grad():
-        logits = policy(x_batch)
-        pm = torch.softmax(logits, dim=-1).mean(dim=0)
-        pm = apply_cz_prior(pm)
-        actions = torch.argmax(pm, dim=-1)
-    return actions
-
-def sample_actions_and_logp(policy, x_batch, eps=1e-8):
-    logits = policy(x_batch)
-    pm = torch.softmax(logits, dim=-1).mean(dim=0)
-    pm = apply_cz_prior(pm)
-    pm = pm.clamp_min(eps)
-    pm = pm / pm.sum(dim=-1, keepdim=True)
-
-    dists = [torch.distributions.Categorical(pm[q]) for q in range(pm.size(0))]
-    actions = torch.stack([d.sample() for d in dists])
-    logp = sum(d.log_prob(a) for d, a in zip(dists, actions))
-    ent = -(pm * pm.log()).sum(dim=-1).mean()
-    uni = torch.full_like(pm, 1.0 / pm.size(-1))
-    kl = torch.sum(pm * (pm.log() - uni.log()))
-    return actions, logp, ent, kl
-
-def reward_from_metrics(bacc, f1, actions, num_qubits):
-    cz_frac = float((actions == 3).sum().item()) / num_qubits
-    return 0.6 * bacc + 0.4 * f1 - 0.05 * cz_frac, cz_frac
-
-
-# ----------------------------- Train / Evaluate
-def train_qnn_fixed_arch(qnn, loader, qnn_loss, device='cpu', epochs=30, lr=3e-3):
-    qnn.train()
-    opt = optim.Adam(qnn.parameters(), lr=lr)
-    for ep in range(epochs):
-        total, correct, loss_sum = 0, 0, 0.0
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad()
-            logits = qnn(xb)
-            loss = qnn_loss(logits, yb)
-            loss.backward()
-            opt.step()
-            loss_sum += loss.item() * xb.size(0)
-            pred = logits.argmax(dim=1)
-            correct += (pred == yb).sum().item()
-            total += xb.size(0)
-        ce = loss_sum / max(1,total)
-        acc = correct / max(1,total)
-        print(f"    [QNN] Epoch {ep+1:02d} | loss={ce:.4f} | acc={acc:.4f}")
-
-def evaluate_model(qnn, loader, device='cpu'):
-    y_true, y_pred = [], []
-    qnn.eval()
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb = xb.to(device)
-            logits = qnn(xb)
-            y_pred.extend(logits.argmax(dim=1).cpu().tolist())
-            y_true.extend(yb.cpu().tolist())
-    return compute_metrics(y_true, y_pred)
-
-
-# ----------------------------- Methods: Naive VQC & QAS runners
-def run_naive_vqc(X, y, tr_idx, va_idx, te_idx, num_qubits, device,
-                  epochs=30, lr=3e-3, batch_size=128, noise: NoiseModel = NoiseModel()):
-    Xtr, ytr = X[tr_idx], y[tr_idx]
-    Xte, yte = X[te_idx], y[te_idx]
-
-    sampler = maybe_make_sampler(ytr, n_classes=2)
-    _, w = make_class_weighted_ce(ytr, device=device, n_classes=2)
-    w = torch.clamp(w, max=3.0)
-    qnn_loss = FocalLoss(weight=w, gamma=2.0)
-    train_loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=batch_size,
-                              sampler=sampler if sampler is not None else None,
-                              shuffle=(sampler is None))
-    test_loader = DataLoader(TensorDataset(Xte, yte), batch_size=batch_size, shuffle=False)
-
-    actions = torch.tensor([1]*(num_qubits-1) + [3], dtype=torch.long, device=device)
-    qlayer, gate_stats = build_qnn_from_actions(actions, num_qubits=num_qubits, depth=2)
-    qlayer = qlayer.to(device)
-
-    qnn = QNNClassifier(
-        qlayer, gate_stats, num_qubits=num_qubits, num_classes=2, fea_dim=X.shape[1],
-        use_tt_encoding=True,
-        tt_in_modes=(4,16,4), tt_out_modes=(3,2,2), tt_ranks=(1,2,3,1),
-        angle_scale=np.pi,
-        noise=noise,
-    ).to(device)
-
-    print(f"  [naive-vqc] Training QNN (fixed circuit, TT-encoding 256->12) with noise={noise} ...")
-    train_qnn_fixed_arch(qnn, train_loader, qnn_loss, device=device, epochs=epochs, lr=lr)
-
-    cm, acc, bacc, f1 = evaluate_model(qnn, test_loader, device=device)
-    print(f"  [naive-vqc] Test | acc={acc:.4f} | bAcc={bacc:.4f} | F1={f1:.4f}\n  Confusion:\n{cm}")
-    return {"acc":acc, "bAcc":bacc, "F1":f1, "cm":cm.tolist()}
-
-def reinforce_update(policy, xb_pol, base_reward, ewc_prev=None, device='cpu',
-                     lr=2e-3, beta_kl=0.01, K=4, use_ewc=False, entropy_bonus=True):
-    policy.train()
-    opt = optim.Adam(policy.parameters(), lr=lr)
-
-    logps, ents, kls = [], [], []
-    for _ in range(K):
-        actions, logp, ent, kl = sample_actions_and_logp(policy, xb_pol)
-        logps.append(logp); ents.append(ent); kls.append(kl)
-
-    logp = torch.stack(logps).mean()
-    ent  = torch.stack(ents).mean()
-    kl   = torch.stack(kls).mean()
-
-    ewc_pen = (ewc_prev.penalty(policy) if (use_ewc and ewc_prev is not None) else 0.0)
-    L = -(base_reward * logp) + beta_kl * kl + ewc_pen
-    if entropy_bonus:
-        L = L - 0.01 * ent
-
-    opt.zero_grad()
-    L.backward()
-    torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-    opt.step()
-
-def run_qas_on_record(X, y, tr_idx, va_idx, te_idx, policy, device, num_qubits,
-                      epochs=30, lr=3e-3, batch_size=128, use_cl=False,
-                      replay=None, prev_ewc=None, ewc_lambda_good=60.0, ewc_lambda_weak=24.0,
-                      noise: NoiseModel = NoiseModel(),
-                      use_tt_encoding=True):
-    """
-    Run one QAS task with or without TT-encoding. Returns metrics and updated EWC.
-    """
-    t0 = time.time()
-
-    Xtr, ytr = X[tr_idx], y[tr_idx]
-    Xva, yva = X[va_idx], y[va_idx]
-    Xte, yte = X[te_idx], y[te_idx]
-
-    if use_cl:
-        counts_tr = torch.bincount(ytr, minlength=2)
-        missing = (counts_tr == 0).nonzero(as_tuple=True)[0].tolist()
-        for mcls in missing:
-            Xbuf, ybuf = replay.sample_missing_class(mcls, n=120) if replay else (None, None)
-            if Xbuf is not None:
-                Xtr = torch.cat([Xtr, Xbuf], dim=0)
-                ytr = torch.cat([ytr, ybuf], dim=0)
-                print(f"  [Replay] Added {len(ybuf)} samples for missing class {mcls}")
-
-    sampler = maybe_make_sampler(ytr, n_classes=2)
-    _, w = make_class_weighted_ce(ytr, device=device, n_classes=2)
-    w = torch.clamp(w, max=3.0)
-    qnn_loss = FocalLoss(weight=w, gamma=2.0)
-    train_loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=batch_size,
-                              sampler=sampler if sampler is not None else None,
-                              shuffle=(sampler is None))
-    val_loader  = DataLoader(TensorDataset(Xva, yva), batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(TensorDataset(Xte, yte), batch_size=batch_size, shuffle=False)
-
-    with torch.no_grad():
-        xb_small = Xtr[:min(128, len(Xtr))].to(device)
-        actions = greedy_actions_from_policy(policy, xb_small)
-
-    qlayer, gate_stats = build_qnn_from_actions(actions, num_qubits=num_qubits, depth=2)
-    qlayer = qlayer.to(device)
-    qnn = QNNClassifier(
-        qlayer, gate_stats, num_qubits=num_qubits, num_classes=2, fea_dim=X.shape[1],
-        use_tt_encoding=use_tt_encoding,
-        tt_in_modes=(4,16,4), tt_out_modes=(3,2,2), tt_ranks=(1,2,3,1),
-        angle_scale=np.pi,
-        noise=noise,
-    ).to(device)
-
-    label_tt = "TT-encoding" if use_tt_encoding else "no TT"
-    print(f"  Training QNN ({label_tt}) with noise={noise} ...")
-    train_qnn_fixed_arch(qnn, train_loader, qnn_loss, device=device, epochs=epochs, lr=lr)
-
-    # Test metrics
-    cm, acc, bacc, f1 = evaluate_model(qnn, test_loader, device=device)
-
-    # Validation reward for policy update
-    cm_v, _, bacc_v, f1_v = evaluate_model(qnn, val_loader, device=device)
-    base_reward, cz_frac = reward_from_metrics(bacc_v, f1_v, actions, num_qubits)
-
-    # Policy update (REINFORCE-like)
-    xb_pol = Xtr[:min(128, len(Xtr))].to(device)
-    reinforce_update(
-        policy, xb_pol,
-        base_reward=torch.tensor(base_reward, dtype=torch.float32, device=device),
-        ewc_prev=prev_ewc, device=device, lr=2e-3, beta_kl=0.01, K=4,
-        use_ewc=use_cl, entropy_bonus=True
+    rng = np.random.RandomState(
+        seed
     )
 
-    next_ewc = prev_ewc
-    if use_cl:
-        lam = ewc_lambda_good if base_reward >= 0.5 else ewc_lambda_weak
-        next_ewc = EWCLoss(policy, DataLoader(TensorDataset(Xtr, ytr), batch_size=128, shuffle=False),
-                           device=device, lambda_ewc=lam)
-        if replay is not None:
-            replay.add(Xtr, ytr, take_per_class=100)
+    labels = y.cpu().numpy()
 
-    runtime = time.time() - t0
-    print(f"  Test | acc={acc:.4f} | bAcc={bacc:.4f} | F1={f1:.4f} | runtime={runtime:.1f}s")
+    train_indices = []
+
+    val_indices = []
+
+    test_indices = []
+
+    for class_id in (
+        0,
+        1,
+    ):
+
+        indices = np.where(
+            labels == class_id
+        )[0].copy()
+
+        rng.shuffle(
+            indices
+        )
+
+        n = len(
+            indices
+        )
+
+        n_train = int(
+            np.floor(
+                train_frac
+                * n
+            )
+        )
+
+        n_val = int(
+            np.floor(
+                val_frac
+                * n
+            )
+        )
+
+        if n >= 3:
+
+            n_train = min(
+                n_train,
+                n - 2,
+            )
+
+            n_val = min(
+                n_val,
+                n - n_train - 1,
+            )
+
+        train_indices.extend(
+            indices[
+                :n_train
+            ].tolist()
+        )
+
+        val_indices.extend(
+            indices[
+                n_train:
+                n_train + n_val
+            ].tolist()
+        )
+
+        test_indices.extend(
+            indices[
+                n_train + n_val:
+            ].tolist()
+        )
+
+    rng.shuffle(
+        train_indices
+    )
+
+    rng.shuffle(
+        val_indices
+    )
+
+    rng.shuffle(
+        test_indices
+    )
+
+    return (
+        torch.tensor(
+            train_indices,
+            dtype=torch.long,
+        ),
+        torch.tensor(
+            val_indices,
+            dtype=torch.long,
+        ),
+        torch.tensor(
+            test_indices,
+            dtype=torch.long,
+        ),
+    )
+
+
+def build_split_cache(
+    tasks,
+    seed,
+):
+
+    """
+    One split per record per seed.
+
+    Critically, Naive-VQC, QAS-No-CL and CL-QAS use the
+    EXACT same samples.
+    """
+
+    cache = {}
+
+    for task_id, (
+        record,
+        _,
+        y,
+    ) in enumerate(
+        tasks,
+        start=1,
+    ):
+
+        split_seed = (
+            SPLIT_SEED_BASE
+            + 100 * seed
+            + task_id
+        )
+
+        (
+            train_idx,
+            val_idx,
+            test_idx,
+        ) = stratified_split_table3(
+            y,
+            seed=split_seed,
+        )
+
+        cache[
+            record
+        ] = {
+            "train_idx":
+            train_idx,
+
+            "val_idx":
+            val_idx,
+
+            "test_idx":
+            test_idx,
+        }
+
+    return cache
+
+
+# ============================================================
+# 6. Train-only standardization
+# ============================================================
+
+@dataclass
+class StandardizationState:
+
+    mean: torch.Tensor
+
+    std: torch.Tensor
+
+
+def fit_standardizer(
+    X_train,
+):
+
+    mean = X_train.mean(
+        dim=0
+    )
+
+    std = X_train.std(
+        dim=0
+    ) + 1e-6
+
+    return StandardizationState(
+        mean=mean,
+        std=std,
+    )
+
+
+def standardize(
+    X,
+    state,
+):
+
+    return (
+        X
+        - state.mean
+    ) / state.std
+
+
+# ============================================================
+# 7. TT-SVD
+# ============================================================
+
+def normalize_state(
+    x,
+    eps=1e-8,
+):
+
+    return x / (
+        torch.linalg.vector_norm(
+            x
+        )
+        + eps
+    )
+
+
+def tt_svd_vector(
+    x,
+    modes=TT_MODES,
+    max_rank=TT_RANK,
+):
+
+    if (
+        int(
+            np.prod(
+                modes
+            )
+        )
+        != x.numel()
+    ):
+
+        raise ValueError(
+            "TT modes do not match "
+            "vector dimension."
+        )
+
+    tensor = x.reshape(
+        *modes
+    )
+
+    cores = []
+
+    rank_prev = 1
+
+    remainder = tensor
+
+    for k in range(
+        len(modes) - 1
+    ):
+
+        n_k = modes[
+            k
+        ]
+
+        matrix = remainder.reshape(
+            rank_prev
+            * n_k,
+            -1,
+        )
+
+        U, S, Vh = torch.linalg.svd(
+            matrix,
+            full_matrices=False,
+        )
+
+        rank = min(
+            max_rank,
+            U.shape[1],
+        )
+
+        U = U[
+            :,
+            :rank
+        ]
+
+        S = S[
+            :rank
+        ]
+
+        Vh = Vh[
+            :rank,
+            :
+        ]
+
+        core = U.reshape(
+            rank_prev,
+            n_k,
+            rank,
+        )
+
+        cores.append(
+            core
+        )
+
+        remainder = (
+            S.unsqueeze(1)
+            * Vh
+        )
+
+        rank_prev = rank
+
+        remainder = remainder.reshape(
+            rank_prev,
+            *modes[
+                k + 1:
+            ],
+        )
+
+    cores.append(
+        remainder.reshape(
+            rank_prev,
+            modes[-1],
+            1,
+        )
+    )
+
+    output = cores[
+        0
+    ]
+
+    for core in cores[
+        1:
+    ]:
+
+        output = torch.einsum(
+            "...a,aib->...ib",
+            output,
+            core,
+        )
+
+    return (
+        output
+        .squeeze(0)
+        .squeeze(-1)
+        .reshape(-1)
+    )
+
+
+def tt_encode_dataset(
+    X,
+    rank=TT_RANK,
+):
+
+    encoded = []
+
+    fidelities = []
+
+    with torch.no_grad():
+
+        for x in X:
+
+            exact = normalize_state(
+                x
+            )
+
+            approximation = tt_svd_vector(
+                x,
+                max_rank=rank,
+            )
+
+            approximation = normalize_state(
+                approximation
+            )
+
+            overlap = torch.dot(
+                exact,
+                approximation,
+            )
+
+            fidelity = (
+                torch.abs(
+                    overlap
+                )
+                ** 2
+            )
+
+            encoded.append(
+                approximation
+            )
+
+            fidelities.append(
+                fidelity
+            )
+
+    return (
+        torch.stack(
+            encoded
+        ),
+        torch.stack(
+            fidelities
+        ),
+    )
+
+
+# ============================================================
+# 8. Task preparation
+#
+# EXACT SAME pipeline as Table 3
+# ============================================================
+
+def prepare_task(
+    X_raw,
+    y,
+    rank,
+    split_info,
+):
+
+    train_idx = split_info[
+        "train_idx"
+    ]
+
+    val_idx = split_info[
+        "val_idx"
+    ]
+
+    test_idx = split_info[
+        "test_idx"
+    ]
+
+
+    X_train_raw = X_raw[
+        train_idx
+    ]
+
+    y_train = y[
+        train_idx
+    ]
+
+
+    X_val_raw = X_raw[
+        val_idx
+    ]
+
+    y_val = y[
+        val_idx
+    ]
+
+
+    X_test_raw = X_raw[
+        test_idx
+    ]
+
+    y_test = y[
+        test_idx
+    ]
+
+
+    # --------------------------------------------------------
+    # Training statistics only
+    # --------------------------------------------------------
+
+    standardizer = fit_standardizer(
+        X_train_raw
+    )
+
+    X_train_std = standardize(
+        X_train_raw,
+        standardizer,
+    )
+
+    X_val_std = standardize(
+        X_val_raw,
+        standardizer,
+    )
+
+    X_test_std = standardize(
+        X_test_raw,
+        standardizer,
+    )
+
+
+    # --------------------------------------------------------
+    # TT representation after standardization
+    # --------------------------------------------------------
+
+    X_train, F_train = tt_encode_dataset(
+        X_train_std,
+        rank,
+    )
+
+    X_val, F_val = tt_encode_dataset(
+        X_val_std,
+        rank,
+    )
+
+    X_test, F_test = tt_encode_dataset(
+        X_test_std,
+        rank,
+    )
+
+
+    fidelity = torch.cat(
+        [
+            F_train,
+            F_val,
+            F_test,
+        ]
+    )
+
     return {
-        "acc": acc,
-        "bAcc": bacc,
-        "F1": f1,
-        "cm": cm.tolist(),
-        "reward": float(base_reward),
-        "cz_frac": float(cz_frac),
-        "runtime": runtime
-    }, next_ewc
+        "X_train":
+        X_train,
+
+        "y_train":
+        y_train,
+
+        "X_val":
+        X_val,
+
+        "y_val":
+        y_val,
+
+        "X_test":
+        X_test,
+
+        "y_test":
+        y_test,
+
+        "fidelity":
+        float(
+            fidelity.mean()
+            .item()
+        ),
+    }
 
 
-# ----------------------------- Task selection
-def select_tasks(candidate_records, max_tasks=8, min_per_class=10):
-    picked = []
-    for rec in candidate_records:
-        try:
-            X, y = extract_record_dataset(rec, max_beats=800, window_sec=0.6, min_per_class=min_per_class)
-            picked.append((rec, X, y))
-            print(f"[task-select] Record {rec} ok. counts={torch.bincount(y, minlength=2).tolist()}")
-            if len(picked) >= max_tasks:
-                break
-        except Exception as e:
-            print(f"[task-select] Skip {rec}: {e}")
-    return picked
+# ============================================================
+# 9. Quantum gates
+# ============================================================
 
+def rx(theta):
 
-# ----------------------------- Summaries
-def _mean_std(arr):
-    a = np.array(arr, dtype=float)
-    return float(np.mean(a)), float(np.std(a))
-
-def summarize(name, results, show_reward_cz=True, show_runtime=False):
-    if not results:
-        print(f"\n{name}: no results")
-        return
-    accs  = [r["acc"]  for r in results]
-    baccs = [r["bAcc"] for r in results]
-    f1s   = [r["F1"]   for r in results]
-    print(f"\n================= Summary ({name}) over {len(results)} tasks =================")
-    for i, r in enumerate(results, 1):
-        parts = [f"acc={r['acc']:.3f}", f"bAcc={r['bAcc']:.3f}", f"F1={r['F1']:.3f}"]
-        if show_reward_cz and ("reward" in r):
-            parts.append(f"reward={r['reward']:.4f}")
-        if show_reward_cz and ("cz_frac" in r):
-            parts.append(f"cz_frac={r['cz_frac']:.2f}")
-        if show_runtime and ("runtime" in r):
-            parts.append(f"runtime={r['runtime']:.1f}s")
-        print(f"  task{i}: " + " | ".join(parts))
-    acc_m, acc_s   = _mean_std(accs)
-    bacc_m, bacc_s = _mean_std(baccs)
-    f1_m, f1_s     = _mean_std(f1s)
-    summary = f"  AVG:   acc={acc_m:.3f}±{acc_s:.3f} | bAcc={bacc_m:.3f}±{bacc_s:.3f} | F1={f1_m:.3f}±{f1_s:.3f}"
-    if show_runtime:
-        rts = [r.get("runtime", np.nan) for r in results if "runtime" in r]
-        if len(rts) > 0:
-            rt_m, rt_s = _mean_std(rts)
-            summary += f" | runtime={rt_m:.1f}±{rt_s:.1f}s"
-    if show_reward_cz:
-        rews  = [r.get("reward", np.nan) for r in results if "reward" in r]
-        czs   = [r.get("cz_frac", np.nan) for r in results if "cz_frac" in r]
-        if len(rews) > 0 and not np.isnan(rews).all():
-            rw_m, rw_s = _mean_std(rews)
-            summary += f" | reward={rw_m:.4f}±{rw_s:.4f}"
-        if len(czs) > 0 and not np.isnan(czs).all():
-            cz_m, cz_s = _mean_std(czs)
-            summary += f" | cz_frac={cz_m:.2f}±{cz_s:.2f}"
-    print(summary)
-
-
-# ----------------------------- Main
-def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    num_qubits = 12
-    batch_size = 128
-    epochs = 30
-    lr = 3e-3
-
-    # Noise defaults (set to 0 for noiseless if desired)
-    noise_defaults = NoiseModel(
-        p_depol_1q=0.001,
-        p_depol_2q=0.001,
-        p_readout=0.01,
-        encoder_jitter_sigma=0.01,
+    c = torch.cos(
+        theta / 2
     )
 
-    candidate_records = [105, 106, 109, 114, 116, 119, 200, 201]
-    max_tasks = 8
-    picked = select_tasks(candidate_records, max_tasks=max_tasks, min_per_class=10)
-    if len(picked) < 2:
-        print("Not enough valid tasks found. Please check your PhysioNet access or candidate list.")
-        return
+    s = torch.sin(
+        theta / 2
+    )
 
-    print(f"\n==> Using {len(picked)} tasks: {[rec for rec,_,_ in picked]}")
+    return torch.stack([
+        torch.stack([
+            c,
+            -1j * s,
+        ]),
+        torch.stack([
+            -1j * s,
+            c,
+        ]),
+    ]).to(
+        COMPLEX
+    )
 
-    fea_dim = picked[0][1].shape[1]  # should be 256
 
-    policy_nocl = QASPolicy(num_qubits=num_qubits, fea_dim=fea_dim, d_model=48, nhead=6).to(device)
-    policy_cl   = QASPolicy(num_qubits=num_qubits, fea_dim=fea_dim, d_model=48, nhead=6).to(device)
+def ry(theta):
 
-    replay = ReplayBuffer(per_class_cap=500)
-    prev_ewc = None
+    c = torch.cos(
+        theta / 2
+    )
 
-    sum_naive, sum_qas, sum_cl_tt, sum_cl_nott = [], [], [], []
+    s = torch.sin(
+        theta / 2
+    )
 
-    for t_idx, (rec, X, y) in enumerate(picked, start=1):
-        print(f"\n================= Task {t_idx} | Record {rec} (N vs V) =================")
+    return torch.stack([
+        torch.stack([
+            c,
+            -s,
+        ]),
+        torch.stack([
+            s,
+            c,
+        ]),
+    ]).to(
+        COMPLEX
+    )
 
-        tr_idx, te_idx = stratified_split_indices(y, train_ratio=0.8, seed=1000 + t_idx)
-        tr2_idx, va_idx = stratified_subsplit_indices(y, base_indices=tr_idx, sub_train_ratio=0.85, seed=2000 + t_idx)
 
-        print("\n================= Baseline: naive-vqc =================")
-        res_naive = run_naive_vqc(X, y, tr2_idx, va_idx, te_idx, num_qubits, device,
-                                  epochs=epochs, lr=lr, batch_size=batch_size,
-                                  noise=noise_defaults)
-        sum_naive.append(res_naive)
+def rz(theta):
 
-        print("\n================= Baseline: qas-no-cl =================")
-        res_qas, _ = run_qas_on_record(
-            X, y, tr2_idx, va_idx, te_idx,
-            policy=policy_nocl, device=device, num_qubits=num_qubits,
-            epochs=epochs, lr=lr, batch_size=batch_size,
-            use_cl=False, replay=None, prev_ewc=None,
-            ewc_lambda_good=60.0, ewc_lambda_weak=24.0,
-            noise=noise_defaults, use_tt_encoding=True
+    a = torch.exp(
+        -0.5j * theta
+    )
+
+    b = torch.exp(
+        0.5j * theta
+    )
+
+    zero = torch.zeros_like(
+        a
+    )
+
+    return torch.stack([
+        torch.stack([
+            a,
+            zero,
+        ]),
+        torch.stack([
+            zero,
+            b,
+        ]),
+    ]).to(
+        COMPLEX
+    )
+
+
+def apply_1q(
+    state,
+    gate,
+    wire,
+):
+
+    batch_size = state.shape[
+        0
+    ]
+
+    psi = state.reshape(
+        batch_size,
+        *(
+            [2]
+            * NUM_QUBITS
+        ),
+    )
+
+    axis = (
+        wire + 1
+    )
+
+    permutation = (
+        [0]
+        +
+        [
+            i
+            for i in range(
+                1,
+                NUM_QUBITS + 1,
+            )
+            if i != axis
+        ]
+        +
+        [axis]
+    )
+
+    psi = (
+        psi
+        .permute(
+            *permutation
         )
-        sum_qas.append(res_qas)
+        .contiguous()
+    )
 
-        print("\n================= Proposed: cl-qas (with TT-encoding) =================")
-        res_cl_tt, prev_ewc = run_qas_on_record(
-            X, y, tr2_idx, va_idx, te_idx,
-            policy=policy_cl, device=device, num_qubits=num_qubits,
-            epochs=epochs, lr=lr, batch_size=batch_size,
-            use_cl=True, replay=replay, prev_ewc=prev_ewc,
-            ewc_lambda_good=60.0, ewc_lambda_weak=24.0,
-            noise=noise_defaults, use_tt_encoding=True
+    old_shape = psi.shape
+
+    psi = psi.reshape(
+        -1,
+        2,
+    )
+
+    psi = torch.einsum(
+        "bi,ji->bj",
+        psi,
+        gate,
+    )
+
+    psi = psi.reshape(
+        old_shape
+    )
+
+    inverse = np.argsort(
+        permutation
+    )
+
+    psi = (
+        psi
+        .permute(
+            *inverse
         )
-        sum_cl_tt.append(res_cl_tt)
+        .contiguous()
+    )
 
-        print("\n================= Ablation: cl-qas (without TT-encoding) =================")
-        # Note: we DO NOT update prev_ewc from the no-TT run; we ablate architecture only.
-        res_cl_nott, _ = run_qas_on_record(
-            X, y, tr2_idx, va_idx, te_idx,
-            policy=policy_cl, device=device, num_qubits=num_qubits,
-            epochs=epochs, lr=lr, batch_size=batch_size,
-            use_cl=True, replay=replay, prev_ewc=prev_ewc,
-            ewc_lambda_good=60.0, ewc_lambda_weak=24.0,
-            noise=noise_defaults, use_tt_encoding=False
+    return psi.reshape(
+        batch_size,
+        -1,
+    )
+
+
+def apply_cnot(
+    state,
+    control,
+    target,
+):
+
+    dimension = (
+        2 ** NUM_QUBITS
+    )
+
+    indices = torch.arange(
+        dimension,
+        device=state.device,
+    )
+
+    control_bit = (
+        indices
+        >> (
+            NUM_QUBITS
+            - 1
+            - control
         )
-        sum_cl_nott.append(res_cl_nott)
+    ) & 1
 
-    # --------- Summaries
-    summarize("naive-vqc", sum_naive, show_reward_cz=False, show_runtime=False)
-    summarize("qas-no-cl",  sum_qas,   show_reward_cz=True,  show_runtime=True)
-    summarize("cl-qas (with TT-encoding)", sum_cl_tt, show_reward_cz=True, show_runtime=True)
-    summarize("cl-qas (without TT-encoding)", sum_cl_nott, show_reward_cz=True, show_runtime=True)
+    target_mask = (
+        1
+        << (
+            NUM_QUBITS
+            - 1
+            - target
+        )
+    )
 
-    # Optional: quick paired deltas (TT - noTT)
-    if len(sum_cl_tt) == len(sum_cl_nott) and len(sum_cl_tt) > 0:
-        d_acc  = [a["acc"]  - b["acc"]  for a,b in zip(sum_cl_tt, sum_cl_nott)]
-        d_bacc = [a["bAcc"] - b["bAcc"] for a,b in zip(sum_cl_tt, sum_cl_nott)]
-        d_f1   = [a["F1"]   - b["F1"]   for a,b in zip(sum_cl_tt, sum_cl_nott)]
-        d_rt   = [a["runtime"] - b["runtime"] for a,b in zip(sum_cl_tt, sum_cl_nott)]
-        print("\n=== CL-QAS (TT) minus CL-QAS (no TT) deltas (per task) ===")
-        for i,(da,db,df,dr) in enumerate(zip(d_acc,d_bacc,d_f1,d_rt),1):
-            print(f" task{i}: Δacc={da:+.3f} | ΔbAcc={db:+.3f} | ΔF1={df:+.3f} | Δruntime={dr:+.1f}s")
-        def ms(x): return f"{np.mean(x):+.3f}±{np.std(x):.3f}"
-        print(f" AVG Δ: acc={ms(d_acc)} | bAcc={ms(d_bacc)} | F1={ms(d_f1)} | runtime={np.mean(d_rt):+.1f}±{np.std(d_rt):.1f}s")
+    mapped = torch.where(
+        control_bit.bool(),
+        indices
+        ^ target_mask,
+        indices,
+    )
 
+    return state[
+        :,
+        mapped,
+    ]
+
+
+def z_expectations(
+    state,
+):
+
+    probabilities = (
+        state.abs()
+        ** 2
+    )
+
+    indices = torch.arange(
+        2 ** NUM_QUBITS,
+        device=state.device,
+    )
+
+    outputs = []
+
+    for qubit in range(
+        NUM_QUBITS
+    ):
+
+        bit = (
+            indices
+            >> (
+                NUM_QUBITS
+                - 1
+                - qubit
+            )
+        ) & 1
+
+        sign = (
+            1.0
+            - 2.0
+            * bit.float()
+        )
+
+        outputs.append(
+            torch.sum(
+                probabilities
+                * sign.unsqueeze(0),
+                dim=1,
+            )
+        )
+
+    return torch.stack(
+        outputs,
+        dim=1,
+    )
+
+
+# ============================================================
+# 10. Circuit architecture
+# ============================================================
+
+@dataclass
+class Architecture:
+
+    depth: int
+
+    patterns: Tuple[
+        str,
+        ...
+    ]
+
+
+def edges_for_pattern(
+    pattern,
+):
+
+    if pattern == "ring":
+
+        return [
+            (
+                q,
+                (q + 1)
+                % NUM_QUBITS,
+            )
+            for q in range(
+                NUM_QUBITS
+            )
+        ]
+
+    if pattern == "linear":
+
+        return [
+            (
+                q,
+                q + 1,
+            )
+            for q in range(
+                NUM_QUBITS - 1
+            )
+        ]
+
+    if pattern == "brick_even":
+
+        return [
+            (
+                q,
+                q + 1,
+            )
+            for q in range(
+                0,
+                NUM_QUBITS - 1,
+                2,
+            )
+        ]
+
+    if pattern == "brick_odd":
+
+        edges = [
+            (
+                q,
+                q + 1,
+            )
+            for q in range(
+                1,
+                NUM_QUBITS - 1,
+                2,
+            )
+        ]
+
+        edges.append(
+            (
+                NUM_QUBITS - 1,
+                0,
+            )
+        )
+
+        return edges
+
+    raise ValueError(
+        f"Unknown pattern: "
+        f"{pattern}"
+    )
+
+
+def architecture_stats(
+    architecture,
+):
+
+    n1 = (
+        architecture.depth
+        * NUM_QUBITS
+        * 3
+    )
+
+    n2 = sum(
+        len(
+            edges_for_pattern(
+                pattern
+            )
+        )
+        for pattern
+        in architecture.patterns
+    )
+
+    return {
+        "depth":
+        architecture.depth,
+
+        "n1":
+        n1,
+
+        "n2":
+        n2,
+    }
+
+
+def naive_architecture():
+
+    return Architecture(
+        depth=4,
+        patterns=(
+            "ring",
+            "ring",
+            "ring",
+            "ring",
+        ),
+    )
+
+
+# ============================================================
+# 11. VQC
+# ============================================================
+
+class VQC(
+    nn.Module
+):
+
+    def __init__(
+        self,
+        architecture,
+    ):
+
+        super().__init__()
+
+        self.architecture = (
+            architecture
+        )
+
+        self.theta = nn.Parameter(
+            0.05
+            * torch.randn(
+                architecture.depth,
+                NUM_QUBITS,
+                3,
+            )
+        )
+
+
+    def forward(
+        self,
+        amplitudes,
+    ):
+
+        state = amplitudes.to(
+            DEVICE,
+            dtype=COMPLEX,
+        )
+
+        for layer in range(
+            self.architecture.depth
+        ):
+
+            for qubit in range(
+                NUM_QUBITS
+            ):
+
+                state = apply_1q(
+                    state,
+                    rx(
+                        self.theta[
+                            layer,
+                            qubit,
+                            0,
+                        ]
+                    ),
+                    qubit,
+                )
+
+                state = apply_1q(
+                    state,
+                    ry(
+                        self.theta[
+                            layer,
+                            qubit,
+                            1,
+                        ]
+                    ),
+                    qubit,
+                )
+
+                state = apply_1q(
+                    state,
+                    rz(
+                        self.theta[
+                            layer,
+                            qubit,
+                            2,
+                        ]
+                    ),
+                    qubit,
+                )
+
+            pattern = (
+                self.architecture
+                .patterns[
+                    layer
+                ]
+            )
+
+            for (
+                control,
+                target,
+            ) in edges_for_pattern(
+                pattern
+            ):
+
+                state = apply_cnot(
+                    state,
+                    control,
+                    target,
+                )
+
+        outputs = z_expectations(
+            state
+        )
+
+        return outputs[
+            :,
+            :NUM_CLASSES,
+        ]
+
+
+# ============================================================
+# 12. QAS policy
+#
+# IMPORTANT:
+# no ring/depth initialization bias;
+# identical to Table 3.
+# ============================================================
+
+class QASPolicy(
+    nn.Module
+):
+
+    def __init__(
+        self,
+        feature_dim=INPUT_DIM,
+        d_model=64,
+        nhead=8,
+        num_layers=2,
+    ):
+
+        super().__init__()
+
+        max_depth = max(
+            DEPTH_CHOICES
+        )
+
+        self.feature_proj = nn.Linear(
+            feature_dim,
+            d_model,
+        )
+
+        self.layer_tokens = nn.Parameter(
+            0.02
+            * torch.randn(
+                1,
+                max_depth,
+                d_model,
+            )
+        )
+
+        encoder_layer = (
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=128,
+                dropout=0.1,
+                batch_first=True,
+            )
+        )
+
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+        self.depth_head = nn.Linear(
+            d_model,
+            len(
+                DEPTH_CHOICES
+            ),
+        )
+
+        self.pattern_head = nn.Linear(
+            d_model,
+            len(
+                ENT_PATTERNS
+            ),
+        )
+
+
+    def forward(
+        self,
+        context,
+    ):
+
+        task_embedding = (
+            self.feature_proj(
+                context
+            )
+            .mean(
+                dim=0,
+                keepdim=True,
+            )
+        )
+
+        hidden = (
+            self.layer_tokens
+            + task_embedding.unsqueeze(1)
+        )
+
+        hidden = self.encoder(
+            hidden
+        )
+
+        pooled = hidden.mean(
+            dim=1
+        )
+
+        depth_logits = (
+            self.depth_head(
+                pooled
+            )
+            .squeeze(0)
+        )
+
+        pattern_logits = (
+            self.pattern_head(
+                hidden
+            )
+            .squeeze(0)
+        )
+
+        return (
+            depth_logits,
+            pattern_logits,
+        )
+
+
+# ============================================================
+# 13. Policy sampling
+# ============================================================
+
+@dataclass
+class PolicySample:
+
+    architecture: Architecture
+
+    log_prob: torch.Tensor
+
+    entropy: torch.Tensor
+
+
+def sample_architecture(
+    policy,
+    context,
+):
+
+    (
+        depth_logits,
+        pattern_logits,
+    ) = policy(
+        context
+    )
+
+    depth_dist = (
+        torch.distributions
+        .Categorical(
+            logits=depth_logits
+        )
+    )
+
+    depth_index = (
+        depth_dist.sample()
+    )
+
+    depth = DEPTH_CHOICES[
+        int(
+            depth_index.item()
+        )
+    ]
+
+    log_prob = (
+        depth_dist.log_prob(
+            depth_index
+        )
+    )
+
+    entropy = (
+        depth_dist.entropy()
+    )
+
+    patterns = []
+
+    for layer in range(
+        depth
+    ):
+
+        pattern_dist = (
+            torch.distributions
+            .Categorical(
+                logits=pattern_logits[
+                    layer
+                ]
+            )
+        )
+
+        pattern_index = (
+            pattern_dist.sample()
+        )
+
+        patterns.append(
+            ENT_PATTERNS[
+                int(
+                    pattern_index.item()
+                )
+            ]
+        )
+
+        log_prob = (
+            log_prob
+            + pattern_dist.log_prob(
+                pattern_index
+            )
+        )
+
+        entropy = (
+            entropy
+            + pattern_dist.entropy()
+        )
+
+    entropy = (
+        entropy
+        / (
+            depth + 1
+        )
+    )
+
+    return PolicySample(
+        architecture=Architecture(
+            depth=depth,
+            patterns=tuple(
+                patterns
+            ),
+        ),
+        log_prob=log_prob,
+        entropy=entropy,
+    )
+
+
+# ============================================================
+# 14. EWC
+# ============================================================
+
+@dataclass
+class EWCState:
+
+    means: Dict[
+        str,
+        torch.Tensor,
+    ]
+
+    fisher: Dict[
+        str,
+        torch.Tensor,
+    ]
+
+
+def estimate_fisher(
+    policy,
+    context,
+    num_samples=24,
+):
+
+    fisher = {
+        name:
+        torch.zeros_like(
+            parameter
+        )
+
+        for (
+            name,
+            parameter,
+        ) in policy.named_parameters()
+
+        if parameter.requires_grad
+    }
+
+    for _ in range(
+        num_samples
+    ):
+
+        policy.zero_grad(
+            set_to_none=True
+        )
+
+        sample = sample_architecture(
+            policy,
+            context,
+        )
+
+        (
+            -sample.log_prob
+        ).backward()
+
+        for (
+            name,
+            parameter,
+        ) in policy.named_parameters():
+
+            if parameter.grad is not None:
+
+                fisher[
+                    name
+                ] += (
+                    parameter.grad
+                    .detach()
+                    ** 2
+                ) / num_samples
+
+    means = {
+        name:
+        parameter
+        .detach()
+        .clone()
+
+        for (
+            name,
+            parameter,
+        ) in policy.named_parameters()
+
+        if parameter.requires_grad
+    }
+
+    return EWCState(
+        means=means,
+        fisher=fisher,
+    )
+
+
+def ewc_penalty(
+    policy,
+    state,
+):
+
+    if state is None:
+
+        return torch.tensor(
+            0.0,
+            device=DEVICE,
+        )
+
+    penalty = torch.tensor(
+        0.0,
+        device=DEVICE,
+    )
+
+    for (
+        name,
+        parameter,
+    ) in policy.named_parameters():
+
+        if name not in state.fisher:
+            continue
+
+        penalty += torch.sum(
+            state.fisher[
+                name
+            ]
+            * (
+                parameter
+                - state.means[
+                    name
+                ]
+            ) ** 2
+        )
+
+    return (
+        0.5
+        * penalty
+    )
+
+
+# ============================================================
+# 15. KL regularization
+# ============================================================
+
+def categorical_kl(
+    current_logits,
+    reference_logits,
+):
+
+    probability = torch.softmax(
+        current_logits,
+        dim=-1,
+    )
+
+    log_probability = torch.log_softmax(
+        current_logits,
+        dim=-1,
+    )
+
+    log_reference = torch.log_softmax(
+        reference_logits,
+        dim=-1,
+    )
+
+    return torch.sum(
+        probability
+        * (
+            log_probability
+            - log_reference
+        ),
+        dim=-1,
+    )
+
+
+def policy_kl(
+    policy,
+    reference_policy,
+    context,
+):
+
+    if reference_policy is None:
+
+        return torch.tensor(
+            0.0,
+            device=DEVICE,
+        )
+
+    (
+        depth_logits,
+        pattern_logits,
+    ) = policy(
+        context
+    )
+
+    with torch.no_grad():
+
+        (
+            reference_depth,
+            reference_pattern,
+        ) = reference_policy(
+            context
+        )
+
+    depth_term = categorical_kl(
+        depth_logits,
+        reference_depth,
+    )
+
+    pattern_term = categorical_kl(
+        pattern_logits,
+        reference_pattern,
+    ).mean()
+
+    return (
+        depth_term
+        + pattern_term
+    )
+
+
+# ============================================================
+# 16. VQC training
+# ============================================================
+
+def class_weighted_loss(
+    y_train,
+):
+
+    counts = torch.bincount(
+        y_train,
+        minlength=2,
+    ).float()
+
+    weights = (
+        counts.sum()
+        / (
+            2.0
+            * counts.clamp_min(1)
+        )
+    )
+
+    # SAME as Table 3.
+    weights = torch.clamp(
+        weights,
+        max=4.0,
+    )
+
+    return nn.CrossEntropyLoss(
+        weight=weights.to(
+            DEVICE
+        )
+    )
+
+
+def train_vqc(
+    architecture,
+    X_train,
+    y_train,
+    epochs,
+    initial_state=None,
+):
+
+    model = VQC(
+        architecture
+    ).to(
+        DEVICE
+    )
+
+    if initial_state is not None:
+
+        model.load_state_dict(
+            initial_state
+        )
+
+    criterion = class_weighted_loss(
+        y_train
+    )
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=VQC_LR,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    for _ in range(
+        epochs
+    ):
+
+        permutation = torch.randperm(
+            len(
+                X_train
+            )
+        )
+
+        model.train()
+
+        for start in range(
+            0,
+            len(
+                X_train
+            ),
+            BATCH_SIZE,
+        ):
+
+            indices = permutation[
+                start:
+                start + BATCH_SIZE
+            ]
+
+            xb = X_train[
+                indices
+            ].to(
+                DEVICE
+            )
+
+            yb = y_train[
+                indices
+            ].to(
+                DEVICE
+            )
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            logits = model(
+                xb
+            )
+
+            loss = criterion(
+                logits,
+                yb,
+            )
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                5.0,
+            )
+
+            optimizer.step()
+
+    return model
+
+
+# ============================================================
+# 17. Predictions and metrics
+# ============================================================
+
+def predict_vqc(
+    model,
+    X,
+    y,
+):
+
+    model.eval()
+
+    truth = []
+
+    predictions = []
+
+    with torch.no_grad():
+
+        for start in range(
+            0,
+            len(X),
+            BATCH_SIZE,
+        ):
+
+            xb = X[
+                start:
+                start + BATCH_SIZE
+            ].to(
+                DEVICE
+            )
+
+            logits = model(
+                xb
+            )
+
+            pred = (
+                logits
+                .argmax(
+                    dim=1
+                )
+                .cpu()
+            )
+
+            predictions.extend(
+                pred.tolist()
+            )
+
+            truth.extend(
+                y[
+                    start:
+                    start + BATCH_SIZE
+                ].tolist()
+            )
+
+    return (
+        np.asarray(
+            truth,
+            dtype=np.int64,
+        ),
+        np.asarray(
+            predictions,
+            dtype=np.int64,
+        ),
+    )
+
+
+def metrics_from_predictions(
+    truth,
+    predictions,
+):
+
+    return {
+        "acc":
+        accuracy_score(
+            truth,
+            predictions,
+        ),
+
+        "bAcc":
+        balanced_accuracy_score(
+            truth,
+            predictions,
+        ),
+
+        "F1":
+        f1_score(
+            truth,
+            predictions,
+            zero_division=0,
+        ),
+    }
+
+
+def evaluate(
+    model,
+    X,
+    y,
+):
+
+    truth, predictions = predict_vqc(
+        model,
+        X,
+        y,
+    )
+
+    return metrics_from_predictions(
+        truth,
+        predictions,
+    )
+
+
+# ============================================================
+# 18. Reward
+# ============================================================
+
+def predictive_score(
+    metrics,
+):
+
+    return (
+        0.70
+        * metrics[
+            "bAcc"
+        ]
+        +
+        0.30
+        * metrics[
+            "F1"
+        ]
+    )
+
+
+def hardware_cost(
+    architecture,
+):
+
+    statistics = architecture_stats(
+        architecture
+    )
+
+    reference_n2 = (
+        4
+        * NUM_QUBITS
+    )
+
+    return (
+        statistics[
+            "n2"
+        ]
+        / reference_n2
+    )
+
+
+def architecture_reward(
+    metrics,
+    architecture,
+):
+
+    return (
+        predictive_score(
+            metrics
+        )
+        -
+        LAMBDA_HW
+        * hardware_cost(
+            architecture
+        )
+    )
+
+
+# ============================================================
+# 19. Candidate evaluation
+# ============================================================
+
+@dataclass
+class CandidateResult:
+
+    architecture: Architecture
+
+    reward: float
+
+    val_metrics: Dict[
+        str,
+        float,
+    ]
+
+    state_dict: Dict[
+        str,
+        torch.Tensor,
+    ]
+
+    log_prob: Optional[
+        torch.Tensor
+    ] = None
+
+    entropy: Optional[
+        torch.Tensor
+    ] = None
+
+
+def evaluate_candidate(
+    architecture,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+):
+
+    model = train_vqc(
+        architecture,
+        X_train,
+        y_train,
+        SEARCH_INNER_EPOCHS,
+    )
+
+    metrics = evaluate(
+        model,
+        X_val,
+        y_val,
+    )
+
+    reward = architecture_reward(
+        metrics,
+        architecture,
+    )
+
+    return CandidateResult(
+        architecture=
+        architecture,
+
+        reward=
+        float(
+            reward
+        ),
+
+        val_metrics=
+        metrics,
+
+        state_dict=
+        copy.deepcopy(
+            model.state_dict()
+        ),
+    )
+
+
+# ============================================================
+# 20. Bi-loop QAS
+#
+# SAME as Table 3:
+# - no ring anchor
+# - no greedy architecture post-selection
+# - no policy bias
+# ============================================================
+
+def search_task(
+    policy,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    *,
+    ewc_state=None,
+    reference_policy=None,
+    use_ewc=True,
+    use_kl=True,
+):
+
+    policy_optimizer = torch.optim.Adam(
+        policy.parameters(),
+        lr=POLICY_LR,
+    )
+
+    context = X_train[
+        :min(
+            192,
+            len(
+                X_train
+            ),
+        )
+    ].to(
+        DEVICE
+    )
+
+    baseline = None
+
+    best_candidate = None
+
+    for _ in range(
+        SEARCH_STEPS
+    ):
+
+        candidates = []
+
+        for _ in range(
+            CANDIDATES_PER_STEP
+        ):
+
+            policy_sample = sample_architecture(
+                policy,
+                context,
+            )
+
+            result = evaluate_candidate(
+                policy_sample.architecture,
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+            )
+
+            result.log_prob = (
+                policy_sample.log_prob
+            )
+
+            result.entropy = (
+                policy_sample.entropy
+            )
+
+            candidates.append(
+                result
+            )
+
+            if (
+                best_candidate is None
+                or result.reward
+                > best_candidate.reward
+            ):
+
+                best_candidate = (
+                    result
+                )
+
+        rewards = np.asarray(
+            [
+                result.reward
+                for result
+                in candidates
+            ],
+            dtype=np.float32,
+        )
+
+        mean_reward = float(
+            rewards.mean()
+        )
+
+        if baseline is None:
+
+            baseline = (
+                mean_reward
+            )
+
+        advantages = torch.tensor(
+            rewards
+            - baseline,
+            dtype=REAL,
+            device=DEVICE,
+        )
+
+        log_probs = torch.stack(
+            [
+                result.log_prob
+                for result
+                in candidates
+            ]
+        )
+
+        entropy = torch.stack(
+            [
+                result.entropy
+                for result
+                in candidates
+            ]
+        ).mean()
+
+        reinforce_loss = -torch.mean(
+            advantages.detach()
+            * log_probs
+        )
+
+        if (
+            use_ewc
+            and
+            ewc_state is not None
+        ):
+
+            L_ewc = ewc_penalty(
+                policy,
+                ewc_state,
+            )
+
+        else:
+
+            L_ewc = torch.tensor(
+                0.0,
+                device=DEVICE,
+            )
+
+        if (
+            use_kl
+            and
+            reference_policy is not None
+        ):
+
+            L_kl = policy_kl(
+                policy,
+                reference_policy,
+                context,
+            )
+
+        else:
+
+            L_kl = torch.tensor(
+                0.0,
+                device=DEVICE,
+            )
+
+        policy_loss = (
+            reinforce_loss
+            +
+            MU_EWC
+            * L_ewc
+            +
+            ETA_KL
+            * L_kl
+            -
+            ENTROPY_COEF
+            * entropy
+        )
+
+        policy_optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        policy_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            policy.parameters(),
+            1.0,
+        )
+
+        policy_optimizer.step()
+
+        baseline = (
+            0.9
+            * baseline
+            +
+            0.1
+            * mean_reward
+        )
+
+    return (
+        best_candidate,
+        context,
+    )
+
+
+# ============================================================
+# 21. Final refit
+#
+# SAME as Table 3:
+# architecture selected on 80/10;
+# fresh VQC trained on combined 90%.
+# ============================================================
+
+def final_refit_and_predict(
+    architecture,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    X_test,
+    y_test,
+):
+
+    X_final = torch.cat(
+        [
+            X_train,
+            X_val,
+        ],
+        dim=0,
+    )
+
+    y_final = torch.cat(
+        [
+            y_train,
+            y_val,
+        ],
+        dim=0,
+    )
+
+    model = train_vqc(
+        architecture,
+        X_final,
+        y_final,
+        epochs=
+        FINAL_REFIT_EPOCHS,
+        initial_state=None,
+    )
+
+    truth, predictions = predict_vqc(
+        model,
+        X_test,
+        y_test,
+    )
+
+    statistics = architecture_stats(
+        architecture
+    )
+
+    return {
+        "y_true":
+        truth,
+
+        "y_pred":
+        predictions,
+
+        "depth":
+        statistics[
+            "depth"
+        ],
+
+        "n1":
+        statistics[
+            "n1"
+        ],
+
+        "n2":
+        statistics[
+            "n2"
+        ],
+
+        "patterns":
+        "|".join(
+            architecture.patterns
+        ),
+    }
+
+
+# ============================================================
+# 22. One complete seed
+# ============================================================
+
+def run_seed(
+    tasks,
+    seed,
+):
+
+    # --------------------------------------------------------
+    # SAME raw partitions for all three methods
+    # --------------------------------------------------------
+
+    split_cache = build_split_cache(
+        tasks,
+        seed,
+    )
+
+
+    # --------------------------------------------------------
+    # Separate policies
+    # --------------------------------------------------------
+
+    set_seed(
+        seed
+    )
+
+    policy_nocl = QASPolicy().to(
+        DEVICE
+    )
+
+
+    set_seed(
+        seed
+    )
+
+    policy_cl = QASPolicy().to(
+        DEVICE
+    )
+
+
+    ewc_state = None
+
+    reference_policy = None
+
+
+    # --------------------------------------------------------
+    # Pooled predictions
+    # --------------------------------------------------------
+
+    pooled = {
+
+        "Naive-VQC": {
+            "true": [],
+            "pred": [],
+            "n2": [],
+            "depth": [],
+            "fidelity": [],
+            "reward": [],
+        },
+
+        "QAS-No-CL": {
+            "true": [],
+            "pred": [],
+            "n2": [],
+            "depth": [],
+            "fidelity": [],
+            "reward": [],
+        },
+
+        "CL-QAS": {
+            "true": [],
+            "pred": [],
+            "n2": [],
+            "depth": [],
+            "fidelity": [],
+            "reward": [],
+        },
+    }
+
+
+    task_rows = []
+
+
+    # ========================================================
+    # Sequential tasks
+    # ========================================================
+
+    for task_id, (
+        record,
+        X_raw,
+        y,
+    ) in enumerate(
+        tasks,
+        start=1,
+    ):
+
+        print(
+            "\n"
+            + "=" * 90
+        )
+
+        print(
+            f"Seed {seed} | "
+            f"Task {task_id} | "
+            f"MIT-BIH record {record}"
+        )
+
+        print(
+            "=" * 90
+        )
+
+
+        # ----------------------------------------------------
+        # ONE prepared dataset shared by all methods
+        # ----------------------------------------------------
+
+        data = prepare_task(
+            X_raw,
+            y,
+            rank=TT_RANK,
+            split_info=
+            split_cache[
+                record
+            ],
+        )
+
+        print(
+            f"TT rank={TT_RANK} | "
+            f"fidelity="
+            f"{data['fidelity']:.6f}"
+        )
+
+
+        # ====================================================
+        # A. Naive-VQC
+        # ====================================================
+
+        print(
+            "\n[Naive-VQC]"
+        )
+
+        naive_arch = naive_architecture()
+
+        naive_result = final_refit_and_predict(
+            naive_arch,
+
+            data[
+                "X_train"
+            ],
+            data[
+                "y_train"
+            ],
+
+            data[
+                "X_val"
+            ],
+            data[
+                "y_val"
+            ],
+
+            data[
+                "X_test"
+            ],
+            data[
+                "y_test"
+            ],
+        )
+
+        naive_metrics = metrics_from_predictions(
+            naive_result[
+                "y_true"
+            ],
+            naive_result[
+                "y_pred"
+            ],
+        )
+
+        pooled[
+            "Naive-VQC"
+        ][
+            "true"
+        ].extend(
+            naive_result[
+                "y_true"
+            ].tolist()
+        )
+
+        pooled[
+            "Naive-VQC"
+        ][
+            "pred"
+        ].extend(
+            naive_result[
+                "y_pred"
+            ].tolist()
+        )
+
+        pooled[
+            "Naive-VQC"
+        ][
+            "n2"
+        ].append(
+            naive_result[
+                "n2"
+            ]
+        )
+
+        pooled[
+            "Naive-VQC"
+        ][
+            "depth"
+        ].append(
+            naive_result[
+                "depth"
+            ]
+        )
+
+        pooled[
+            "Naive-VQC"
+        ][
+            "fidelity"
+        ].append(
+            data[
+                "fidelity"
+            ]
+        )
+
+        task_rows.append({
+
+            "seed":
+            seed,
+
+            "task":
+            task_id,
+
+            "record":
+            record,
+
+            "method":
+            "Naive-VQC",
+
+            **naive_metrics,
+
+            "reward":
+            np.nan,
+
+            "depth":
+            naive_result[
+                "depth"
+            ],
+
+            "n1":
+            naive_result[
+                "n1"
+            ],
+
+            "n2":
+            naive_result[
+                "n2"
+            ],
+
+            "patterns":
+            naive_result[
+                "patterns"
+            ],
+
+            "tt_fidelity":
+            data[
+                "fidelity"
+            ],
+        })
+
+        print(
+            f"Test | "
+            f"Acc={naive_metrics['acc']:.4f} | "
+            f"BAcc={naive_metrics['bAcc']:.4f} | "
+            f"F1={naive_metrics['F1']:.4f} | "
+            f"#2Q={naive_result['n2']}"
+        )
+
+
+        # ====================================================
+        # B. QAS-No-CL
+        # ====================================================
+
+        print(
+            "\n[QAS-No-CL]"
+        )
+
+        qas_candidate, _ = search_task(
+
+            policy_nocl,
+
+            data[
+                "X_train"
+            ],
+            data[
+                "y_train"
+            ],
+
+            data[
+                "X_val"
+            ],
+            data[
+                "y_val"
+            ],
+
+            ewc_state=None,
+
+            reference_policy=None,
+
+            use_ewc=False,
+
+            use_kl=False,
+        )
+
+        qas_result = final_refit_and_predict(
+
+            qas_candidate.architecture,
+
+            data[
+                "X_train"
+            ],
+            data[
+                "y_train"
+            ],
+
+            data[
+                "X_val"
+            ],
+            data[
+                "y_val"
+            ],
+
+            data[
+                "X_test"
+            ],
+            data[
+                "y_test"
+            ],
+        )
+
+        qas_metrics = metrics_from_predictions(
+            qas_result[
+                "y_true"
+            ],
+            qas_result[
+                "y_pred"
+            ],
+        )
+
+        pooled[
+            "QAS-No-CL"
+        ][
+            "true"
+        ].extend(
+            qas_result[
+                "y_true"
+            ].tolist()
+        )
+
+        pooled[
+            "QAS-No-CL"
+        ][
+            "pred"
+        ].extend(
+            qas_result[
+                "y_pred"
+            ].tolist()
+        )
+
+        pooled[
+            "QAS-No-CL"
+        ][
+            "n2"
+        ].append(
+            qas_result[
+                "n2"
+            ]
+        )
+
+        pooled[
+            "QAS-No-CL"
+        ][
+            "depth"
+        ].append(
+            qas_result[
+                "depth"
+            ]
+        )
+
+        pooled[
+            "QAS-No-CL"
+        ][
+            "fidelity"
+        ].append(
+            data[
+                "fidelity"
+            ]
+        )
+
+        pooled[
+            "QAS-No-CL"
+        ][
+            "reward"
+        ].append(
+            qas_candidate.reward
+        )
+
+        task_rows.append({
+
+            "seed":
+            seed,
+
+            "task":
+            task_id,
+
+            "record":
+            record,
+
+            "method":
+            "QAS-No-CL",
+
+            **qas_metrics,
+
+            "reward":
+            qas_candidate.reward,
+
+            "depth":
+            qas_result[
+                "depth"
+            ],
+
+            "n1":
+            qas_result[
+                "n1"
+            ],
+
+            "n2":
+            qas_result[
+                "n2"
+            ],
+
+            "patterns":
+            qas_result[
+                "patterns"
+            ],
+
+            "tt_fidelity":
+            data[
+                "fidelity"
+            ],
+        })
+
+        print(
+            f"Test | "
+            f"Acc={qas_metrics['acc']:.4f} | "
+            f"BAcc={qas_metrics['bAcc']:.4f} | "
+            f"F1={qas_metrics['F1']:.4f} | "
+            f"#2Q={qas_result['n2']} | "
+            f"R={qas_candidate.reward:.4f}"
+        )
+
+
+        # ====================================================
+        # C. CL-QAS
+        # ====================================================
+
+        print(
+            "\n[CL-QAS]"
+        )
+
+        cl_candidate, context = search_task(
+
+            policy_cl,
+
+            data[
+                "X_train"
+            ],
+            data[
+                "y_train"
+            ],
+
+            data[
+                "X_val"
+            ],
+            data[
+                "y_val"
+            ],
+
+            ewc_state=
+            ewc_state,
+
+            reference_policy=
+            reference_policy,
+
+            use_ewc=True,
+
+            use_kl=True,
+        )
+
+        cl_result = final_refit_and_predict(
+
+            cl_candidate.architecture,
+
+            data[
+                "X_train"
+            ],
+            data[
+                "y_train"
+            ],
+
+            data[
+                "X_val"
+            ],
+            data[
+                "y_val"
+            ],
+
+            data[
+                "X_test"
+            ],
+            data[
+                "y_test"
+            ],
+        )
+
+        cl_metrics = metrics_from_predictions(
+            cl_result[
+                "y_true"
+            ],
+            cl_result[
+                "y_pred"
+            ],
+        )
+
+        pooled[
+            "CL-QAS"
+        ][
+            "true"
+        ].extend(
+            cl_result[
+                "y_true"
+            ].tolist()
+        )
+
+        pooled[
+            "CL-QAS"
+        ][
+            "pred"
+        ].extend(
+            cl_result[
+                "y_pred"
+            ].tolist()
+        )
+
+        pooled[
+            "CL-QAS"
+        ][
+            "n2"
+        ].append(
+            cl_result[
+                "n2"
+            ]
+        )
+
+        pooled[
+            "CL-QAS"
+        ][
+            "depth"
+        ].append(
+            cl_result[
+                "depth"
+            ]
+        )
+
+        pooled[
+            "CL-QAS"
+        ][
+            "fidelity"
+        ].append(
+            data[
+                "fidelity"
+            ]
+        )
+
+        pooled[
+            "CL-QAS"
+        ][
+            "reward"
+        ].append(
+            cl_candidate.reward
+        )
+
+        task_rows.append({
+
+            "seed":
+            seed,
+
+            "task":
+            task_id,
+
+            "record":
+            record,
+
+            "method":
+            "CL-QAS",
+
+            **cl_metrics,
+
+            "reward":
+            cl_candidate.reward,
+
+            "depth":
+            cl_result[
+                "depth"
+            ],
+
+            "n1":
+            cl_result[
+                "n1"
+            ],
+
+            "n2":
+            cl_result[
+                "n2"
+            ],
+
+            "patterns":
+            cl_result[
+                "patterns"
+            ],
+
+            "tt_fidelity":
+            data[
+                "fidelity"
+            ],
+        })
+
+        print(
+            f"Test | "
+            f"Acc={cl_metrics['acc']:.4f} | "
+            f"BAcc={cl_metrics['bAcc']:.4f} | "
+            f"F1={cl_metrics['F1']:.4f} | "
+            f"#2Q={cl_result['n2']} | "
+            f"R={cl_candidate.reward:.4f}"
+        )
+
+
+        # ====================================================
+        # Update CL state after task
+        # ====================================================
+
+        ewc_state = estimate_fisher(
+            policy_cl,
+            context,
+        )
+
+        reference_policy = (
+            copy.deepcopy(
+                policy_cl
+            )
+            .eval()
+        )
+
+        for parameter in (
+            reference_policy.parameters()
+        ):
+
+            parameter.requires_grad_(
+                False
+            )
+
+
+    # ========================================================
+    # ONE pooled result per method per seed
+    # ========================================================
+
+    seed_rows = []
+
+    print(
+        "\n"
+        + "-" * 90
+    )
+
+    print(
+        f"POOLED RESULTS | seed={seed}"
+    )
+
+    print(
+        "-" * 90
+    )
+
+
+    for method in (
+        "Naive-VQC",
+        "QAS-No-CL",
+        "CL-QAS",
+    ):
+
+        truth = np.asarray(
+            pooled[
+                method
+            ][
+                "true"
+            ],
+            dtype=np.int64,
+        )
+
+        predictions = np.asarray(
+            pooled[
+                method
+            ][
+                "pred"
+            ],
+            dtype=np.int64,
+        )
+
+        metrics = metrics_from_predictions(
+            truth,
+            predictions,
+        )
+
+        mean_n2 = float(
+            np.mean(
+                pooled[
+                    method
+                ][
+                    "n2"
+                ]
+            )
+        )
+
+        mean_depth = float(
+            np.mean(
+                pooled[
+                    method
+                ][
+                    "depth"
+                ]
+            )
+        )
+
+        mean_fidelity = float(
+            np.mean(
+                pooled[
+                    method
+                ][
+                    "fidelity"
+                ]
+            )
+        )
+
+        if method == "Naive-VQC":
+
+            mean_reward = np.nan
+
+        else:
+
+            mean_reward = float(
+                np.mean(
+                    pooled[
+                        method
+                    ][
+                        "reward"
+                    ]
+                )
+            )
+
+        seed_rows.append({
+
+            "seed":
+            seed,
+
+            "method":
+            method,
+
+            "acc":
+            metrics[
+                "acc"
+            ],
+
+            "bAcc":
+            metrics[
+                "bAcc"
+            ],
+
+            "F1":
+            metrics[
+                "F1"
+            ],
+
+            "reward":
+            mean_reward,
+
+            "n2":
+            mean_n2,
+
+            "depth":
+            mean_depth,
+
+            "tt_fidelity":
+            mean_fidelity,
+
+            "n_test":
+            int(
+                len(
+                    truth
+                )
+            ),
+        })
+
+        print(
+            f"{method:12s} | "
+            f"Acc={metrics['acc']:.4f} | "
+            f"BAcc={metrics['bAcc']:.4f} | "
+            f"F1={metrics['F1']:.4f} | "
+            f"#2Q={mean_n2:.2f}"
+        )
+
+    return (
+        seed_rows,
+        task_rows,
+    )
+
+
+# ============================================================
+# 23. Summary
+# ============================================================
+
+def summarize(
+    seed_df,
+):
+
+    summary = (
+        seed_df
+        .groupby(
+            "method"
+        )[
+            [
+                "acc",
+                "bAcc",
+                "F1",
+                "reward",
+                "n2",
+                "tt_fidelity",
+            ]
+        ]
+        .agg(
+            [
+                "mean",
+                "std",
+            ]
+        )
+    )
+
+    print(
+        "\n"
+        + "=" * 110
+    )
+
+    print(
+        "TABLE 1: OVERALL ECG PERFORMANCE "
+        "(POOLED TEST PREDICTIONS; "
+        "MEAN +/- STD ACROSS SEEDS)"
+    )
+
+    print(
+        "=" * 110
+    )
+
+    print(
+        summary.to_string()
+    )
+
+    return summary
+
+
+# ============================================================
+# 24. Flatten summary
+# ============================================================
+
+def flatten_summary(
+    summary,
+):
+
+    output = summary.copy()
+
+    output.columns = [
+        f"{metric}_{stat}"
+        for (
+            metric,
+            stat,
+        ) in output.columns
+    ]
+
+    return output.reset_index()
+
+
+# ============================================================
+# 25. Main
+# ============================================================
+
+def main():
+
+    print(
+        "=" * 90
+    )
+
+    print(
+        "CL-QAS TABLE 1 ECG EXPERIMENT "
+        "ALIGNED WITH TABLE 3"
+    )
+
+    print(
+        "=" * 90
+    )
+
+    print(
+        f"Device: {DEVICE}"
+    )
+
+    print(
+        f"Seeds: {SEEDS}"
+    )
+
+    print(
+        f"TT rank: {TT_RANK}"
+    )
+
+    print(
+        f"Search budget: "
+        f"{SEARCH_STEPS} steps x "
+        f"{CANDIDATES_PER_STEP} candidates x "
+        f"{SEARCH_INNER_EPOCHS} inner epochs"
+    )
+
+    print(
+        f"Search split: "
+        f"{SEARCH_TRAIN_FRAC:.0%} train / "
+        f"{SEARCH_VAL_FRAC:.0%} validation / "
+        f"{1.0 - SEARCH_TRAIN_FRAC - SEARCH_VAL_FRAC:.0%} test"
+    )
+
+    print(
+        "Final evaluation: "
+        "train + validation = 90%, "
+        "test = 10%"
+    )
+
+
+    # --------------------------------------------------------
+    # Load data once
+    # --------------------------------------------------------
+
+    tasks = load_tasks()
+
+    print(
+        "\nSequential tasks:"
+    )
+
+    print(
+        [
+            record
+            for (
+                record,
+                _,
+                _,
+            ) in tasks
+        ]
+    )
+
+
+    # --------------------------------------------------------
+    # Run seeds
+    # --------------------------------------------------------
+
+    all_seed_rows = []
+
+    all_task_rows = []
+
+    for seed in SEEDS:
+
+        (
+            seed_rows,
+            task_rows,
+        ) = run_seed(
+            tasks,
+            seed,
+        )
+
+        all_seed_rows.extend(
+            seed_rows
+        )
+
+        all_task_rows.extend(
+            task_rows
+        )
+
+
+    seed_df = pd.DataFrame(
+        all_seed_rows
+    )
+
+    task_df = pd.DataFrame(
+        all_task_rows
+    )
+
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    summary = summarize(
+        seed_df
+    )
+
+    flat_summary = flatten_summary(
+        summary
+    )
+
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
+    seed_df.to_csv(
+        "table1_ecg_seed_results.csv",
+        index=False,
+    )
+
+    task_df.to_csv(
+        "table1_ecg_task_diagnostics.csv",
+        index=False,
+    )
+
+    summary.to_csv(
+        "table1_ecg_summary.csv"
+    )
+
+    flat_summary.to_csv(
+        "table1_ecg_summary_flat.csv",
+        index=False,
+    )
+
+
+    print(
+        "\nSaved:"
+    )
+
+    print(
+        "  table1_ecg_seed_results.csv"
+    )
+
+    print(
+        "  table1_ecg_task_diagnostics.csv"
+    )
+
+    print(
+        "  table1_ecg_summary.csv"
+    )
+
+    print(
+        "  table1_ecg_summary_flat.csv"
+    )
+
+
+# ============================================================
+# Entry
+# ============================================================
 
 if __name__ == "__main__":
+
     main()
