@@ -1,809 +1,2755 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-finance_cl_qas_tt256_noise.py
+finance_clqas_revised.py
 
-Financial time-series CL-QAS with 256-D inputs + TT-encoding (4,16,4)->(3,2,2):
-- tt_in_modes=(4,16,4), tt_out_modes=(3,2,2), tt_ranks=(1,2,3,1)  => 256 -> 12 angles
-- QASPolicy is feature-adaptive: takes 256-D, internally produces per-qubit tokens (Q=12)
-- Noise model: 1q depolarizing, 2q Pauli after CZ, symmetric readout error
-- Methods: naive-vqc (fixed arch), qas-no-cl, cl-qas (with EWC + replay)
-- Reporting: pretty console tables, CSV per-task + summary (means/stds), rewards included
+Financial CL-QAS experiment aligned with the revised manuscript.
 
-Dependencies:
-  torch, numpy, pandas, scikit-learn, torchquantum
+Pipeline
+--------
+Financial price series
+    -> causal technical features
+    -> 32 timesteps x 8 features = 256-D input
+    -> training-only robust normalization
+    -> rank-r TT-SVD approximation
+    -> normalized 256-dimensional amplitude state
+    -> 8-qubit VQC
+
+Methods
+-------
+1. Naive-VQC
+   Fixed depth-4 ring-entangled VQC.
+
+2. QAS-No-CL
+   Transformer architecture policy with genuine bi-loop QAS.
+
+3. CL-QAS
+   Same QAS framework with:
+       - EWC regularization
+       - KL(pi_phi || pi_ref)
+       - no replay buffer
+
+Architecture search
+-------------------
+The policy selects:
+    - depth: {2, 3, 4}
+    - entangling pattern per layer:
+        ring, linear, brick_even, brick_odd
+
+All candidate circuits use RX-RY-RZ rotations on every qubit.
+
+Reward
+------
+    R_m = c_m - lambda_hw * C(A_m)
+
+where
+    c_m = 0.70 * balanced_accuracy + 0.30 * F1.
+
+If no valid financial CSV is provided, the script automatically
+uses a synthetic regime-switching financial series for debugging.
+
+Dependencies
+------------
+pip install torch numpy pandas scikit-learn
 """
 
-import os, math, random, argparse
-import numpy as np
-from typing import List, Dict, Optional
+import argparse
+import copy
+import csv
+import os
+import random
 from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 
-import torchquantum as tq
-from sklearn.metrics import confusion_matrix, f1_score
-import pandas as pd
 
-# ========================= Repro =========================
-def set_seed(seed=1234):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+# ============================================================
+# Configuration
+# ============================================================
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+REAL = torch.float32
+COMPLEX = torch.complex64
+
+LOOKBACK = 32
+BASE_FEATURES = 8
+INPUT_DIM = LOOKBACK * BASE_FEATURES  # 256
+
+NUM_QUBITS = 8
+NUM_CLASSES = 2
+
+TT_MODES = (4, 16, 4)
+TT_RANK = 3
+
+DEPTH_CHOICES = (2, 3, 4)
+ENT_PATTERNS = ("ring", "linear", "brick_even", "brick_odd")
+
+SEARCH_STEPS = 15
+CANDIDATES_PER_STEP = 4
+SEARCH_INNER_EPOCHS = 10
+FINAL_EPOCHS = 40
+
+BATCH_SIZE = 64
+
+VQC_LR = 3e-3
+POLICY_LR = 1e-3
+WEIGHT_DECAY = 1e-5
+
+MU_EWC = 0.5
+ETA_KL = 0.01
+ENTROPY_COEF = 0.002
+
+LAMBDA_HW = 0.01
+
+DEFAULT_SEEDS = (11, 22, 33, 44, 55)
+
+
+# ============================================================
+# Reproducibility
+# ============================================================
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-# ========================= Finance data & 256-D features =========================
-def _ema(x, span):
-    alpha = 2.0/(span+1.0)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ============================================================
+# Financial indicators
+# ============================================================
+
+def _ema(x: np.ndarray, span: int) -> np.ndarray:
+    alpha = 2.0 / (span + 1.0)
+
     y = np.zeros_like(x, dtype=np.float64)
     y[0] = x[0]
+
     for t in range(1, len(x)):
-        y[t] = alpha*x[t] + (1-alpha)*y[t-1]
+        y[t] = alpha * x[t] + (1.0 - alpha) * y[t - 1]
+
     return y
 
-def _rsi(close, period=14):
-    r = np.diff(close, prepend=close[0])
-    up = np.maximum(r, 0.0)
-    dn = np.maximum(-r, 0.0)
-    ema_up = _ema(up, period)
-    ema_dn = _ema(dn, period)
-    rs = np.divide(ema_up, np.maximum(1e-12, ema_dn))
-    return 100.0 - (100.0/(1.0+rs))
 
-def _macd(close, fast=12, slow=26, signal=9):
+def _rolling_mean(x: np.ndarray, window: int) -> np.ndarray:
+    out = np.zeros_like(x, dtype=np.float64)
+    cumsum = np.cumsum(np.insert(x, 0, 0.0))
+
+    for t in range(len(x)):
+        start = max(0, t - window + 1)
+        length = t - start + 1
+        out[t] = (cumsum[t + 1] - cumsum[start]) / length
+
+    return out
+
+
+def _rolling_std(x: np.ndarray, window: int) -> np.ndarray:
+    out = np.zeros_like(x, dtype=np.float64)
+
+    for t in range(len(x)):
+        start = max(0, t - window + 1)
+        segment = x[start:t + 1]
+        out[t] = np.std(segment)
+
+    return out
+
+
+def _rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
+    delta = np.diff(close, prepend=close[0])
+
+    up = np.maximum(delta, 0.0)
+    down = np.maximum(-delta, 0.0)
+
+    ema_up = _ema(up, period)
+    ema_down = _ema(down, period)
+
+    rs = ema_up / np.maximum(ema_down, 1e-12)
+
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+def _macd(
+    close: np.ndarray,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     ema_fast = _ema(close, fast)
     ema_slow = _ema(close, slow)
+
     macd = ema_fast - ema_slow
-    sig = _ema(macd, signal)
-    hist = macd - sig
-    return macd, sig, hist
+    signal_line = _ema(macd, signal)
+    hist = macd - signal_line
 
-def _rolling_mean(x, w):
-    c = np.cumsum(np.insert(x,0,0.0))
-    res = (c[w:] - c[:-w]) / float(w)
-    res = np.concatenate([np.full(w-1, res[0]), res])
-    return res
+    return macd, signal_line, hist
 
-def _rolling_std(x, w):
-    m = _rolling_mean(x, w)
-    s2 = _rolling_mean((x-m)**2, w)
-    return np.sqrt(np.maximum(0.0, s2))
 
-def _base8_features(close, lookback=32):
-    """8 indicators per timestep (N x 8)."""
-    close = close.astype(np.float64)
-    ret = np.diff(close, prepend=close[0]) / np.maximum(1e-8, close)
+def base_features(
+    close: np.ndarray,
+    lookback: int = LOOKBACK,
+) -> np.ndarray:
+    close = np.asarray(close, dtype=np.float64)
+
+    ret = np.zeros_like(close, dtype=np.float64)
+    ret[1:] = (
+        close[1:] - close[:-1]
+    ) / np.maximum(close[:-1], 1e-8)
+
     r_mean = _rolling_mean(ret, lookback)
-    r_std  = _rolling_std(ret, lookback)
-    rsi = _rsi(close, period=14)/100.0
-    macd, sig, hist = _macd(close)
-    mom = close / np.maximum(1e-8, _ema(close, lookback)) - 1.0
-    bb_z = (close - _rolling_mean(close, lookback)) / np.maximum(1e-8, _rolling_std(close, lookback))
-    vol = _rolling_std(ret, 5)
-    feats = np.stack([ret, r_mean, r_std, rsi, hist, mom, bb_z, vol], axis=1)
-    feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-    return feats.astype(np.float32)  # (N, 8)
+    r_std = _rolling_std(ret, lookback)
 
-def _labels_from_returns(close, horizon=1):
-    r = np.diff(close, n=horizon, prepend=[close[0]]*horizon) / np.maximum(1e-8, close)
-    y = (r > 0.0).astype(np.int64)
-    return y
+    rsi = _rsi(close, period=14) / 100.0
 
-def _stack_last_L(feats, L=32):
-    """Create 256-D by stacking last L=32 timesteps of 8-D -> 256-D."""
-    N, D = feats.shape
-    assert D == 8
-    if N < L:
-        raise ValueError("Not enough timesteps to build 256-D windows.")
+    _, _, macd_hist = _macd(close)
+
+    ema_price = _ema(close, lookback)
+    momentum = close / np.maximum(ema_price, 1e-8) - 1.0
+
+    rolling_price_mean = _rolling_mean(close, lookback)
+    rolling_price_std = _rolling_std(close, lookback)
+
+    bb_z = (
+        close - rolling_price_mean
+    ) / np.maximum(rolling_price_std, 1e-8)
+
+    short_vol = _rolling_std(ret, 5)
+
+    features = np.stack(
+        [
+            ret,
+            r_mean,
+            r_std,
+            rsi,
+            macd_hist,
+            momentum,
+            bb_z,
+            short_vol,
+        ],
+        axis=1,
+    )
+
+    return np.nan_to_num(
+        features,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).astype(np.float32)
+
+
+# ============================================================
+# Future-return labels
+# ============================================================
+
+def future_direction_labels(
+    close: np.ndarray,
+    horizon: int = 1,
+) -> np.ndarray:
+    if horizon <= 0:
+        raise ValueError("horizon must be positive.")
+
+    close = np.asarray(close, dtype=np.float64)
+
+    labels = np.full(
+        len(close),
+        -1,
+        dtype=np.int64,
+    )
+
+    future_return = (
+        close[horizon:] - close[:-horizon]
+    ) / np.maximum(close[:-horizon], 1e-8)
+
+    labels[:-horizon] = (
+        future_return > 0.0
+    ).astype(np.int64)
+
+    return labels
+
+
+# ============================================================
+# 256-D temporal windows
+# ============================================================
+
+def construct_windows(
+    features: np.ndarray,
+    labels: np.ndarray,
+    lookback: int = LOOKBACK,
+) -> Tuple[np.ndarray, np.ndarray]:
     X = []
-    for t in range(L-1, N):
-        window = feats[t-L+1:t+1].reshape(-1)  # (L*8) == 256
-        X.append(window)
-    return np.stack(X, axis=0)  # (N-L+1, 256)
+    y = []
 
-def load_close_from_csv(csv_path):
-    df = pd.read_csv(csv_path)
-    for c in ['Close','close','Adj Close','adj_close']:
-        if c in df.columns:
-            arr = df[c].values.astype(np.float64)
-            if np.all(np.isfinite(arr)) and arr.size > 300:
-                return arr
-    raise RuntimeError(f"Could not find a close-like column in {csv_path}")
-
-def make_synthetic_close(n=6000, regimes=6, seed=777):
-    rs = np.random.RandomState(seed)
-    x = np.zeros(n, dtype=np.float64)
-    price = 100.0; seg = n // regimes; idx = 0
-    for k in range(regimes):
-        mu = rs.uniform(-0.0002, 0.0005)
-        sigma = rs.uniform(0.004, 0.02)
-        phi = rs.uniform(0.1, 0.8)
-        T = seg if k < regimes-1 else n-idx
-        eps = rs.normal(0, sigma, size=T)
-        r = np.zeros(T)
-        for t in range(T):
-            r[t] = mu + phi*(r[t-1] if t>0 else 0.0) + eps[t]
-        for t in range(T):
-            price *= (1.0 + r[t])
-            x[idx] = price
-            idx += 1
-    return x
-
-def build_finance_tasks(close, n_tasks=8, lookback=32, horizon=1, min_per_task=500):
-    """
-    Build tasks with 256-D inputs:
-      - Build base 8-D features per timestep
-      - Stack last L=32 steps -> 256-D vectors
-      - Align labels to the 256-D samples (drop first L-1)
-    """
-    feats8 = _base8_features(close, lookback=lookback)     # (N, 8)
-    X256 = _stack_last_L(feats8, L=lookback)               # (N-L+1, 256)
-    y_all = _labels_from_returns(close, horizon=horizon)   # (N,)
-    y_all = np.roll(y_all, -1); y_all[-1] = y_all[-2]
-    y = y_all[lookback-1:]                                 # align to X256 length
-
-    # Robust normalization (per task later as well)
-    Ltot = len(X256)
-    cuts = np.linspace(0, Ltot, n_tasks+1, dtype=int)
-    tasks = []
-    for i in range(n_tasks):
-        s, e = cuts[i], cuts[i+1]
-        Xi, yi = X256[s:e], y[s:e]
-        if len(Xi) < min_per_task:
+    for t in range(lookback - 1, len(features)):
+        if labels[t] < 0:
             continue
-        med = np.median(Xi, axis=0, keepdims=True)
-        mad = np.median(np.abs(Xi - med), axis=0, keepdims=True) + 1e-6
-        Zi = np.tanh((Xi - med) / (1.4826 * mad))
-        tasks.append((torch.tensor(Zi, dtype=torch.float32),
-                      torch.tensor(yi, dtype=torch.long)))
+
+        window = features[
+            t - lookback + 1:t + 1
+        ].reshape(-1)
+
+        if window.size != INPUT_DIM:
+            raise RuntimeError(
+                f"Expected {INPUT_DIM}-D input, got {window.size}."
+            )
+
+        X.append(window)
+        y.append(labels[t])
+
+    return (
+        np.asarray(X, dtype=np.float32),
+        np.asarray(y, dtype=np.int64),
+    )
+
+
+# ============================================================
+# Data loading
+# ============================================================
+
+def load_close_from_csv(path: str) -> np.ndarray:
+    df = pd.read_csv(path)
+
+    candidate_columns = (
+        "Adj Close",
+        "Adj_Close",
+        "adj_close",
+        "Close",
+        "close",
+    )
+
+    for column in candidate_columns:
+        if column not in df.columns:
+            continue
+
+        values = df[column].to_numpy(dtype=np.float64)
+        values = values[np.isfinite(values)]
+
+        if len(values) > 300:
+            return values
+
+    raise RuntimeError(
+        f"No usable Close/Adj Close column found in {path}."
+    )
+
+
+def make_synthetic_close(
+    n: int = 8000,
+    regimes: int = 8,
+    seed: int = 777,
+) -> np.ndarray:
+    rng = np.random.RandomState(seed)
+
+    prices = np.zeros(n, dtype=np.float64)
+
+    price = 100.0
+    segment_length = n // regimes
+    index = 0
+
+    for regime in range(regimes):
+        drift = rng.uniform(-0.0004, 0.0006)
+        volatility = rng.uniform(0.004, 0.018)
+        phi = rng.uniform(-0.10, 0.55)
+
+        length = (
+            segment_length
+            if regime < regimes - 1
+            else n - index
+        )
+
+        innovations = rng.normal(
+            0.0,
+            volatility,
+            size=length,
+        )
+
+        returns = np.zeros(length)
+
+        for t in range(length):
+            previous = returns[t - 1] if t > 0 else 0.0
+            returns[t] = drift + phi * previous + innovations[t]
+
+        for r in returns:
+            price = max(
+                1e-3,
+                price * (1.0 + r),
+            )
+
+            prices[index] = price
+            index += 1
+
+    return prices
+
+
+# ============================================================
+# Sequential financial tasks
+# ============================================================
+
+def build_finance_tasks(
+    close: np.ndarray,
+    n_tasks: int = 8,
+    lookback: int = LOOKBACK,
+    horizon: int = 1,
+    min_per_task: int = 400,
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    features = base_features(
+        close,
+        lookback=lookback,
+    )
+
+    labels = future_direction_labels(
+        close,
+        horizon=horizon,
+    )
+
+    X, y = construct_windows(
+        features,
+        labels,
+        lookback=lookback,
+    )
+
+    cuts = np.linspace(
+        0,
+        len(X),
+        n_tasks + 1,
+        dtype=int,
+    )
+
+    tasks = []
+
+    for task_id in range(n_tasks):
+        start = cuts[task_id]
+        end = cuts[task_id + 1]
+
+        Xi = X[start:end]
+        yi = y[start:end]
+
+        if len(Xi) < min_per_task:
+            print(
+                f"[task-build] Skip task {task_id + 1}: "
+                f"only {len(Xi)} samples."
+            )
+            continue
+
+        counts = np.bincount(
+            yi,
+            minlength=2,
+        )
+
+        print(
+            f"[task-build] Task {task_id + 1}: "
+            f"n={len(Xi)}, "
+            f"class0={counts[0]}, "
+            f"class1={counts[1]}"
+        )
+
+        tasks.append(
+            (
+                torch.tensor(Xi, dtype=REAL),
+                torch.tensor(yi, dtype=torch.long),
+            )
+        )
+
     return tasks
 
-# ========================= Replay Buffer (CL) =========================
-class ReplayBuffer:
-    def __init__(self, per_class_cap=400):
-        self.data = {0: [], 1: []}
-        self.cap = per_class_cap
-    def add(self, X, y, take_per_class=120):
-        for c in [0, 1]:
-            idx = (y == c).nonzero(as_tuple=True)[0]
-            if len(idx) == 0: continue
-            sel = idx[torch.randperm(len(idx))[:min(len(idx), take_per_class)]]
-            feats = X[sel].cpu(); labs = y[sel].cpu()
-            self.data[c].extend(list(zip(feats, labs)))
-            if len(self.data[c]) > self.cap:
-                self.data[c] = self.data[c][-self.cap:]
-    def sample_missing_class(self, missing_class, n=120):
-        pool = self.data.get(missing_class, [])
-        if not pool: return None, None
-        take = min(n, len(pool))
-        sel = random.sample(pool, take)
-        feats = torch.stack([t[0] for t in sel])
-        labs = torch.stack([t[1] for t in sel])
-        return feats, labs
 
-# ========================= Policy (feature-adaptive, 256->Q tokens) =========================
-class QASPolicy(nn.Module):
-    """
-    Feature-adaptive: consumes 256-D inputs and emits per-qubit action logits (B, Q, 4),
-    where Q is the number of qubits. A linear 'adapt' maps 256 -> Q tokens.
-    """
-    def __init__(self, num_qubits=12, fea_dim=256, d_model=64, nhead=8, num_layers=2, dropout=0.1):
-        super().__init__()
-        self.num_qubits = num_qubits
-        self.fea_dim = fea_dim
-        self.adapt = nn.Linear(fea_dim, num_qubits)
-        self.token_embed = nn.Linear(1, d_model)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, batch_first=True, dropout=dropout, dim_feedforward=4*d_model
+# ============================================================
+# Chronological train / validation / test split
+# ============================================================
+
+def time_split(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
+):
+    n = len(X)
+
+    n_train = max(
+        int(train_frac * n),
+        64,
+    )
+
+    n_val = max(
+        int(val_frac * n),
+        32,
+    )
+
+    if n_train + n_val >= n:
+        raise RuntimeError(
+            "Task is too small for chronological "
+            "train/validation/test splitting."
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.pos = nn.Parameter(torch.randn(1, num_qubits, d_model) * 0.02)
-        self.head = nn.Linear(d_model, 4)  # RX, RY, RZ, CZ
-    def forward(self, x):
-        tok = self.adapt(x).unsqueeze(-1)     # (B, Q, 1)
-        h = self.token_embed(tok)             # (B, Q, d_model)
-        h = self.encoder(h + self.pos)
-        return self.head(h)                   # (B, Q, 4)
 
-# ========================= TT-encoding (256 -> 12) =========================
-class TTMatrix(nn.Module):
-    """
-    TT-matrix mapping R^{prod(in_modes)} -> R^{prod(out_modes)} with cores G_k in R^{r_{k-1} x n_k x m_k x r_k}
-    """
-    def __init__(self, in_modes, out_modes, tt_ranks):
-        super().__init__()
-        assert len(in_modes) == len(out_modes)
-        self.in_modes = tuple(in_modes)
-        self.out_modes = tuple(out_modes)
-        self.d = len(in_modes)
-        self.tt_ranks = tuple(tt_ranks)
-        assert self.tt_ranks[0] == 1 and self.tt_ranks[-1] == 1 and len(self.tt_ranks) == self.d + 1
-        cores = []
-        for k in range(self.d):
-            r0, r1 = self.tt_ranks[k], self.tt_ranks[k+1]
-            nk, mk = self.in_modes[k], self.out_modes[k]
-            G = nn.Parameter(0.02 * torch.randn(r0, nk, mk, r1))
-            cores.append(G)
-        self.cores = nn.ParameterList(cores)
-    @property
-    def in_features(self):  return int(np.prod(self.in_modes))
-    @property
-    def out_features(self): return int(np.prod(self.out_modes))
-    def forward(self, x):
-        B = x.shape[0]
-        y = x.view(B, *self.in_modes)  # (B, n1,...,nd)
-        left = y.unsqueeze(1)          # (B, 1, n1,...,nd)
-        r_prev = 1
-        for k in range(self.d):
-            G = self.cores[k]  # (r_{k-1}, n_k, m_k, r_k)
-            nk, mk = self.in_modes[k], self.out_modes[k]
-            left = left.contiguous().view(B, r_prev, nk, -1)  # (B, r_prev, nk, R)
-            R = left.shape[-1]
-            left_flat = left.view(B, r_prev*nk, R)                    # (B, r_prev*nk, R)
-            core_flat = G.view(r_prev*nk, mk*self.tt_ranks[k+1])      # (r_prev*nk, mk*r_k)
-            out = torch.matmul(left_flat.transpose(1,2), core_flat)   # (B, R, mk*r_k)
-            out = out.view(B, R, mk, self.tt_ranks[k+1]).transpose(1,3)  # (B, r_k, mk, R)
-            left = out
-            r_prev = self.tt_ranks[k+1]
-        left = left.squeeze(1)          # (B, mk, R_final)
-        left = left.contiguous().view(B, -1)
-        return left.view(B, self.out_features)
+    i1 = n_train
+    i2 = n_train + n_val
 
-class TTEncoder(nn.Module):
-    """
-    Wraps TTMatrix to produce per-qubit angles:
-      256 -> 12 via TT, then LayerNorm + tanh scaling -> [-pi, pi]
-    """
-    def __init__(self,
-                 in_modes=(4,16,4),
-                 out_modes=(3,2,2),
-                 tt_ranks=(1,2,3,1),
-                 angle_scale=np.pi,
-                 post_norm=True):
-        super().__init__()
-        self.tt = TTMatrix(in_modes, out_modes, tt_ranks)
-        assert self.tt.in_features == 256, "tt_in_modes must multiply to 256"
-        assert self.tt.out_features == 12, "tt_out_modes must multiply to 12"
-        self.post = nn.LayerNorm(self.tt.out_features) if post_norm else nn.Identity()
-        self.angle_scale = float(angle_scale)
-    def forward(self, x):
-        y = self.tt(x)               # (B, 12)
-        y = self.post(y)
-        return torch.tanh(y) * self.angle_scale
-
-# ========================= Noise helpers (torchquantum compatible) =========================
-class NoiseConfig:
-    def __init__(self, p_depol_1q=0.0, p_error_2q=0.0, p_readout=0.0):
-        self.p1 = float(p_depol_1q)   # single-qubit depolarizing
-        self.p2 = float(p_error_2q)   # two-qubit Pauli error after CZ
-        self.pro = float(p_readout)   # readout bit-flip prob
-
-def _apply_random_pauli_1q(qdev, wire: int, which: int):
-    device = getattr(qdev, "device", None)
-    if device is None:
-        try:
-            device = qdev.states.device
-        except Exception:
-            device = "cpu"
-    angle = torch.full((qdev.bsz,), math.pi, device=device)
-    if which == 0:   tq.RX(has_params=False)(qdev, wires=wire, params=angle)
-    elif which == 1: tq.RY(has_params=False)(qdev, wires=wire, params=angle)
-    else:            tq.RZ(has_params=False)(qdev, wires=wire, params=angle)
-
-def _maybe_depolarize_layer(qdev, num_qubits: int, p1: float):
-    if p1 <= 0.0: return
-    import random as pyr
-    for i in range(num_qubits):
-        if pyr.random() < p1:
-            _apply_random_pauli_1q(qdev, i, pyr.randint(0, 2))
-
-def _maybe_2q_error(qdev, i: int, j: int, p2: float):
-    if p2 <= 0.0: return
-    import random as pyr
-    if pyr.random() < p2:
-        a = pyr.randint(0, 3)  # 0=I,1=X,2=Y,3=Z
-        b = pyr.randint(0, 3)
-        if a != 0: _apply_random_pauli_1q(qdev, i, a-1)
-        if b != 0: _apply_random_pauli_1q(qdev, j, b-1)
-
-# ========================= Hybrid adapter + QNN with noise =========================
-class FeatureAdapter(nn.Module):
-    """
-    256 -> (TT) -> 12 angles; optional small MLP to refine angles (here: identity after TT+LN+tanh*pi).
-    """
-    def __init__(self, tt_in_modes=(4,16,4), tt_out_modes=(3,2,2), tt_ranks=(1,2,3,1), angle_scale=np.pi):
-        super().__init__()
-        self.tt_enc = TTEncoder(in_modes=tt_in_modes, out_modes=tt_out_modes, tt_ranks=tt_ranks,
-                                angle_scale=angle_scale, post_norm=True)
-    def forward(self, x):
-        return self.tt_enc(x)  # (B, 12) in [-pi, pi]
-
-def build_qnn_from_actions(actions, num_qubits=12, depth=4, reupload=True, extra_cz=True,
-                           noise: Optional[NoiseConfig] = None):
-    if noise is None: noise = NoiseConfig()
-    class GeneratedQNN(tq.QuantumModule):
-        def __init__(self):
-            super().__init__()
-            self.num_qubits = num_qubits
-            self.depth = depth
-            self.actions = actions.detach().cpu().tolist()
-            self.noise = noise
-        def _encode(self, qdev, angles):
-            # angles already in radians [-pi, pi]
-            for i in range(self.num_qubits):
-                tq.RY(has_params=False)(qdev, wires=i, params=angles[:, i])
-        def _single_qubit_layer(self, qdev):
-            for i, a in enumerate(self.actions):
-                if a == 0:   tq.RX(has_params=True, trainable=True, init_params=0.08)(qdev, wires=i)
-                elif a == 1: tq.RY(has_params=True, trainable=True, init_params=0.08)(qdev, wires=i)
-                elif a == 2: tq.RZ(has_params=True, trainable=True, init_params=0.08)(qdev, wires=i)
-                else:        tq.RY(has_params=True, trainable=True, init_params=0.03)(qdev, wires=i)
-            _maybe_depolarize_layer(qdev, self.num_qubits, self.noise.p1)
-        def _entangle_ring(self, qdev):
-            for i in range(self.num_qubits):
-                j = (i + 1) % self.num_qubits
-                tq.CZ()(qdev, wires=[i, j])
-                _maybe_2q_error(qdev, i, j, self.noise.p2)
-            if extra_cz:
-                for i, a in enumerate(self.actions):
-                    if a == 3:
-                        j = (i + 2) % self.num_qubits
-                        tq.CZ()(qdev, wires=[i, j])
-                        _maybe_2q_error(qdev, i, j, self.noise.p2)
-        def forward(self, qdev, angles):
-            if reupload:
-                for _ in range(self.depth):
-                    self._encode(qdev, angles)
-                    self._single_qubit_layer(qdev)
-                    self._entangle_ring(qdev)
-            else:
-                self._encode(qdev, angles)
-                for _ in range(self.depth):
-                    self._single_qubit_layer(qdev)
-                    self._entangle_ring(qdev)
-    return GeneratedQNN()
-
-class QNNClassifier(nn.Module):
-    def __init__(self, qlayer: tq.QuantumModule, num_qubits=12, num_classes=2,
-                 readout_prob: float = 0.01,
-                 tt_in_modes=(4,16,4), tt_out_modes=(3,2,2), tt_ranks=(1,2,3,1)):
-        super().__init__()
-        self.adapter = FeatureAdapter(tt_in_modes, tt_out_modes, tt_ranks, angle_scale=np.pi)
-        self.q_layer = qlayer
-        self.measure = tq.MeasureAll(tq.PauliZ)
-        self.fc = nn.Linear(num_qubits, num_classes)
-        self.readout_prob = float(readout_prob)
-    def forward(self, x256):
-        angles = self.adapter(x256)  # (B, 12) in radians
-        bsz = angles.shape[0]
-        qdev = tq.QuantumDevice(n_wires=self.fc.in_features, bsz=bsz, device=angles.device)
-        self.q_layer(qdev, angles)
-        z = self.measure(qdev)  # (B, 12)
-        if self.readout_prob > 0.0:
-            z = (1.0 - 2.0 * self.readout_prob) * z
-        return self.fc(z)
-
-# ========================= EWC for policy =========================
-class EWCLoss:
-    def __init__(self, model: nn.Module, dataloader, device='cpu', lambda_ewc=50.0):
-        self.model = model; self.device = device; self.lambda_ewc = lambda_ewc
-        self.params = {n: p.clone().detach() for n, p in model.named_parameters()}
-        self.fisher = self._compute_fisher(dataloader)
-    def _compute_fisher(self, dataloader):
-        fim = {n: torch.zeros_like(p, device=self.device) for n, p in self.model.named_parameters()}
-        self.model.eval()
-        for xb, _ in dataloader:
-            xb = xb.to(self.device)
-            self.model.zero_grad()
-            logits = self.model(xb)  # (B,Q,4)
-            probs = torch.softmax(logits, dim=-1)
-            pm = probs.mean(dim=0)
-            dists = [torch.distributions.Categorical(pm[q]) for q in range(pm.size(0))]
-            actions = torch.stack([d.sample() for d in dists])
-            logp = sum(d.log_prob(a) for d, a in zip(dists, actions))
-            (-logp).backward()
-            for n, p in self.model.named_parameters():
-                if p.grad is not None:
-                    fim[n] += (p.grad.detach() ** 2) / len(dataloader)
-        return fim
-    def penalty(self, model):
-        loss = 0.0
-        for n, p in model.named_parameters():
-            loss = loss + (self.fisher[n] * (p - self.params[n])**2).sum()
-        return self.lambda_ewc * loss
-
-# ========================= Metrics, loaders, training =========================
-def make_class_weighted_ce(y, device, n_classes=2, label_smoothing=0.05):
-    counts = torch.bincount(y, minlength=n_classes).float()
-    counts[counts == 0] = 1.0
-    weights = 1.0 / counts
-    weights = weights / weights.sum() * n_classes
-    return nn.CrossEntropyLoss(weight=weights.to(device), label_smoothing=label_smoothing), weights
-
-def maybe_make_sampler(y, n_classes=2):
-    counts = torch.bincount(y, minlength=n_classes).float()
-    if (counts > 0).sum() < 2: return None
-    class_weights = 1.0 / (counts + 1e-6)
-    sample_weights = class_weights[y]
-    return WeightedRandomSampler(weights=sample_weights, num_samples=len(y), replacement=True)
-
-def compute_metrics(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
-    total = cm.sum()
-    acc = (np.trace(cm) / total) if total > 0 else 0.0
-    tpr0 = cm[0,0] / max(1, cm[0].sum()); tpr1 = cm[1,1] / max(1, cm[1].sum())
-    bacc = 0.5*(tpr0 + tpr1)
-    f1 = f1_score(y_true, y_pred, average='binary', zero_division=0)
-    return cm, acc, bacc, f1
-
-def time_split(X, y, train_frac=0.8, val_frac=0.1):
-    n = len(X); n_train = int(train_frac * n)
-    n_val = int(val_frac * n)
-    n_train = max(32, n_train); n_val = max(16, n_val)
-    n_train = min(n-32, n_train); n_val = min(n - n_train - 16, n_val)
-    i1 = n_train; i2 = n_train + n_val
-    Xtr, ytr = X[:i1], y[:i1]
-    Xva, yva = X[i1:i2], y[i1:i2]
-    Xte, yte = X[i2:], y[i2:]
-    return Xtr, ytr, Xva, yva, Xte, yte
-
-def train_qnn_fixed_arch(qnn, train_loader, val_loader, ce_loss, device='cpu',
-                         epochs=40, lr=2e-3, wd=1e-4, patience=6, clip=1.0):
-    qnn.train()
-    opt = optim.Adam(qnn.parameters(), lr=lr, weight_decay=wd)
-    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr*0.1)
-    best_val = float('inf'); best_state = None; bad = 0
-    for ep in range(epochs):
-        total, correct, loss_sum = 0, 0, 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad()
-            logits = qnn(xb)
-            loss = ce_loss(logits, yb)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(qnn.parameters(), clip)
-            opt.step()
-            loss_sum += loss.item() * xb.size(0)
-            pred = logits.argmax(dim=1)
-            correct += (pred == yb).sum().item()
-            total += xb.size(0)
-        ce = loss_sum / max(1,total)
-        acc = correct / max(1,total)
-        qnn.eval()
-        with torch.no_grad():
-            vloss, vcount = 0.0, 0
-            for xb, yb in val_loader:
-                xb = xb.to(device); yb = yb.to(device)
-                vloss += ce_loss(qnn(xb), yb).item() * xb.size(0)
-                vcount += xb.size(0)
-            vce = vloss / max(1, vcount)
-        qnn.train(); sched.step()
-        print(f"    [QNN] Epoch {ep+1:02d} | tr_loss={ce:.4f} | tr_acc={acc:.4f} | val_loss={vce:.4f}")
-        if vce < best_val - 1e-4:
-            best_val = vce; best_state = {k: v.detach().cpu().clone() for k, v in qnn.state_dict().items()}
-            bad = 0
-        else:
-            bad += 1
-            if bad >= patience:
-                print(f"    Early stop at epoch {ep+1} (best val_loss={best_val:.4f})")
-                break
-    if best_state is not None:
-        qnn.load_state_dict(best_state)
-
-# ========================= Policy helpers & reward =========================
-def apply_cz_prior(pm, max_expected_cz=0.30, scale=0.5, eps=1e-8):
-    expected_cz = pm[:, 3].mean()
-    if expected_cz.detach().item() > max_expected_cz:
-        pm = pm.clone()
-        pm[:, 3] = pm[:, 3] * scale
-        pm = pm / (pm.sum(dim=-1, keepdim=True) + eps)
-    return pm
-
-def greedy_actions_from_policy(policy, x_batch):
-    with torch.no_grad():
-        logits = policy(x_batch)                 # (B,Q,4)
-        pm = torch.softmax(logits, dim=-1).mean(dim=0)
-        pm = apply_cz_prior(pm)
-        actions = torch.argmax(pm, dim=-1)
-    return actions
-
-def reward_from_metrics(bacc, f1, actions, num_qubits):
-    cz_frac = float((actions == 3).sum().item()) / num_qubits
-    # lightweight structural penalty
-    reward = 0.6 * bacc + 0.4 * f1 - 0.05 * cz_frac
-    return reward, cz_frac
-
-class RewardBaseline:
-    def __init__(self, beta=0.9): self.beta = beta; self.val = None
-    def update(self, r):
-        self.val = r if self.val is None else (self.beta*self.val + (1-self.beta)*r)
-        return self.val
-
-def reinforce_update(policy, x_batch, reward_scalar, baseline_val=None,
-                     ewc_prev=None, device='cpu', lr=2e-3, beta_kl=0.01, clip=1.0):
-    policy.train()
-    opt = optim.Adam(policy.parameters(), lr=lr)
-    logits = policy(x_batch)                         # (B,Q,4)
-    pm = torch.softmax(logits, dim=-1).mean(dim=0)  # (Q,4)
-    pm = apply_cz_prior(pm)
-    dists = [torch.distributions.Categorical(pm[q]) for q in range(pm.size(0))]
-    actions = torch.stack([d.sample() for d in dists])  # (Q,)
-    logp = sum(d.log_prob(a) for d, a in zip(dists, actions))
-    uni = torch.full_like(pm, 1.0/pm.size(-1))
-    kl = torch.sum(pm * (pm.clamp_min(1e-8).log() - uni.log()))
-    ewc_pen = ewc_prev.penalty(policy) if ewc_prev is not None else 0.0
-    adv = torch.tensor(float(reward_scalar if baseline_val is None else reward_scalar - baseline_val), device=device)
-    L = -(adv * logp) + beta_kl * kl + ewc_pen
-    opt.zero_grad(); L.backward()
-    torch.nn.utils.clip_grad_norm_(policy.parameters(), clip)
-    opt.step()
-    return actions.detach()
-
-# ========================= Data loaders (time-aware) =========================
-def _make_loaders_time_aware(X, y, device, batch_size=128):
-    Xtr, ytr, Xva, yva, Xte, yte = time_split(X, y, train_frac=0.8, val_frac=0.1)
-    sampler = maybe_make_sampler(ytr)
-    train_loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=batch_size,
-                              sampler=sampler if sampler is not None else None,
-                              shuffle=(sampler is None))
-    val_loader = DataLoader(TensorDataset(Xva, yva), batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(TensorDataset(Xte, yte), batch_size=batch_size, shuffle=False)
-    return (Xtr, ytr, Xva, yva, Xte, yte), train_loader, val_loader, test_loader
-
-# ========================= Method runners =========================
-def run_naive_vqc_on_task(X, y, device, epochs=40, lr=2e-3, batch_size=128,
-                          noise: Optional[NoiseConfig] = None, num_qubits=12):
-    (Xtr,ytr,Xva,yva,Xte,yte), tr_loader, va_loader, te_loader = _make_loaders_time_aware(X, y, device, batch_size)
-    ce_loss, _ = make_class_weighted_ce(ytr, device=device, label_smoothing=0.05)
-    # Hand-crafted actions: all RY + ring CZ at the end qubit
-    actions = torch.tensor([1]*(num_qubits-1) + [3], dtype=torch.long, device=device)
-    adapter = None  # Naive-VQC uses TT inside classifier; adapter is in QNNClassifier already
-    qlayer = build_qnn_from_actions(actions, num_qubits=num_qubits, depth=4,
-                                    reupload=True, extra_cz=False, noise=noise).to(device)
-    qnn = QNNClassifier(qlayer, num_qubits=num_qubits, num_classes=2,
-                        readout_prob=(0.0 if noise is None else noise.pro),
-                        tt_in_modes=(4,16,4), tt_out_modes=(3,2,2), tt_ranks=(1,2,3,1)).to(device)
-    print("  Training QNN (naive-vqc, TT 256->12)...")
-    train_qnn_fixed_arch(qnn, tr_loader, va_loader, ce_loss, device=device, epochs=epochs, lr=lr)
-    # Test
-    qnn.eval(); y_true, y_pred = [], []
-    with torch.no_grad():
-        for xb, yb in te_loader:
-            xb = xb.to(device)
-            logits = qnn(xb)
-            y_pred.extend(logits.argmax(dim=1).cpu().tolist())
-            y_true.extend(yb.cpu().tolist())
-    cm, acc, bacc, f1 = compute_metrics(y_true, y_pred)
-    print(f"  Test | acc={acc:.4f} | bAcc={bacc:.4f} | F1={f1:.4f}\n  Confusion:\n{cm}")
-    tn, fp, fn, tp = int(cm[0,0]), int(cm[0,1]), int(cm[1,0]), int(cm[1,1])
-    return {"acc":acc, "bacc":bacc, "f1":f1, "cm":cm, "cz_frac":0.0, "reward":np.nan,
-            "tn":tn, "fp":fp, "fn":fn, "tp":tp}
-
-def run_qas_on_task(policy, X, y, device, prev_ewc=None, use_cl=False,
-                    replay=None, reward_baseline=None, epochs=40, lr=2e-3, batch_size=128,
-                    noise: Optional[NoiseConfig] = None, num_qubits=12):
-    (Xtr,ytr,Xva,yva,Xte,yte), tr_loader, va_loader, te_loader = _make_loaders_time_aware(X, y, device, batch_size)
-    if use_cl:
-        counts_tr = torch.bincount(ytr, minlength=2)
-        missing = (counts_tr == 0).nonzero(as_tuple=True)[0].tolist()
-        for m in missing:
-            Xbuf, ybuf = (None, None) if replay is None else replay.sample_missing_class(m, n=120)
-            if Xbuf is not None:
-                Xtr = torch.cat([Xtr, Xbuf], dim=0)
-                ytr = torch.cat([ytr, ybuf], dim=0)
-        tr_loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=batch_size, shuffle=True)
-    ce_loss, _ = make_class_weighted_ce(ytr, device=device, label_smoothing=0.05)
-
-    with torch.no_grad():
-        xb_small = Xtr[:min(512, len(Xtr))].to(device)
-        actions = greedy_actions_from_policy(policy, xb_small)  # length Q=num_qubits
-
-    qlayer = build_qnn_from_actions(actions, num_qubits=num_qubits, depth=4,
-                                    reupload=True, extra_cz=True, noise=noise).to(device)
-    qnn = QNNClassifier(qlayer, num_qubits=num_qubits, num_classes=2,
-                        readout_prob=(0.0 if noise is None else noise.pro),
-                        tt_in_modes=(4,16,4), tt_out_modes=(3,2,2), tt_ranks=(1,2,3,1)).to(device)
-
-    print("  Training QNN (policy-selected arch, TT 256->12)...")
-    train_qnn_fixed_arch(qnn, tr_loader, va_loader, ce_loss, device=device, epochs=epochs, lr=lr)
-
-    # Test metrics
-    qnn.eval(); y_true, y_pred = [], []
-    with torch.no_grad():
-        for xb, yb in te_loader:
-            xb = xb.to(device)
-            logits = qnn(xb)
-            y_pred.extend(logits.argmax(dim=1).cpu().tolist())
-            y_true.extend(yb.cpu().tolist())
-    cm, acc, bacc, f1 = compute_metrics(y_true, y_pred)
-
-    # Validation reward for policy update
-    y_true_v, y_pred_v = [], []
-    qnn.eval()
-    with torch.no_grad():
-        for xb, yb in va_loader:
-            xb = xb.to(device)
-            logits = qnn(xb)
-            y_pred_v.extend(logits.argmax(dim=1).cpu().tolist())
-            y_true_v.extend(yb.cpu().tolist())
-    cm_v, _, bacc_v, f1_v = compute_metrics(y_true_v, y_pred_v)
-    reward, cz_frac = reward_from_metrics(bacc_v, f1_v, actions, num_qubits)
-
-    print(f"  Test | acc={acc:.4f} | bAcc={bacc:.4f} | F1={f1:.4f}\n  Confusion:\n{cm}")
-    print(f"  Policy update... reward={reward:.4f} (cz_frac={cz_frac:.2f})")
-
-    xb_pol = Xtr[:min(512, len(Xtr))].to(device)
-    baseline_val = reward_baseline.update(reward) if reward_baseline is not None else None
-    actions_after = reinforce_update(
-        policy, xb_pol, reward, baseline_val=baseline_val,
-        ewc_prev=prev_ewc if use_cl else None, device=device, lr=1.5e-3, beta_kl=0.01
+    return (
+        X[:i1],
+        y[:i1],
+        X[i1:i2],
+        y[i1:i2],
+        X[i2:],
+        y[i2:],
     )
 
-    if use_cl and replay is not None:
-        replay.add(Xtr, ytr, take_per_class=140)
 
-    tn, fp, fn, tp = int(cm[0,0]), int(cm[0,1]), int(cm[1,0]), int(cm[1,1])
-    return {"acc":acc, "bacc":bacc, "f1":f1, "cm":cm, "reward":float(reward),
-            "actions":actions.tolist(), "actions_after":actions_after.tolist(),
-            "cz_frac":float(cz_frac), "tn":tn, "fp":fp, "fn":fn, "tp":tp}
+# ============================================================
+# Train-only robust normalization
+# ============================================================
 
-# ========================= Reporting =========================
-def accumulate_results(rows: List[Dict], method: str, task_idx: int, res: Dict):
-    row = {
-        "method": method,
-        "task": task_idx,
-        "acc": float(res["acc"]),
-        "bacc": float(res["bacc"]),
-        "f1": float(res["f1"]),
-        "reward": (np.nan if np.isnan(res.get("reward", np.nan)) else float(res.get("reward", np.nan))),
-        "cz_frac": float(res.get("cz_frac", 0.0)),
-        "tn": int(res.get("tn", 0)),
-        "fp": int(res.get("fp", 0)),
-        "fn": int(res.get("fn", 0)),
-        "tp": int(res.get("tp", 0)),
+@dataclass
+class RobustScalerState:
+    median: torch.Tensor
+    scale: torch.Tensor
+
+
+def fit_robust_scaler(
+    X_train: torch.Tensor,
+) -> RobustScalerState:
+    median = torch.median(
+        X_train,
+        dim=0,
+    ).values
+
+    absolute_deviation = torch.abs(
+        X_train - median
+    )
+
+    mad = torch.median(
+        absolute_deviation,
+        dim=0,
+    ).values
+
+    scale = 1.4826 * mad + 1e-6
+
+    return RobustScalerState(
+        median=median,
+        scale=scale,
+    )
+
+
+def transform_robust(
+    X: torch.Tensor,
+    scaler: RobustScalerState,
+) -> torch.Tensor:
+    Z = (
+        X - scaler.median
+    ) / scaler.scale
+
+    return torch.tanh(Z)
+
+
+# ============================================================
+# TT-SVD approximation
+# ============================================================
+
+def normalize_state(
+    x: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    return x / (
+        torch.linalg.vector_norm(x)
+        + eps
+    )
+
+
+def tt_svd_vector(
+    x: torch.Tensor,
+    modes: Tuple[int, ...] = TT_MODES,
+    max_rank: int = TT_RANK,
+) -> torch.Tensor:
+    if int(np.prod(modes)) != x.numel():
+        raise ValueError(
+            f"TT modes {modes} do not match "
+            f"vector size {x.numel()}."
+        )
+
+    tensor = x.reshape(*modes)
+
+    cores = []
+    r_prev = 1
+    remainder = tensor
+
+    for k in range(len(modes) - 1):
+        n_k = modes[k]
+
+        matrix = remainder.reshape(
+            r_prev * n_k,
+            -1,
+        )
+
+        U, S, Vh = torch.linalg.svd(
+            matrix,
+            full_matrices=False,
+        )
+
+        rank = min(
+            max_rank,
+            U.shape[1],
+        )
+
+        U = U[:, :rank]
+        S = S[:rank]
+        Vh = Vh[:rank, :]
+
+        core = U.reshape(
+            r_prev,
+            n_k,
+            rank,
+        )
+
+        cores.append(core)
+
+        remainder = S.unsqueeze(1) * Vh
+        r_prev = rank
+
+        remainder = remainder.reshape(
+            r_prev,
+            *modes[k + 1:],
+        )
+
+    cores.append(
+        remainder.reshape(
+            r_prev,
+            modes[-1],
+            1,
+        )
+    )
+
+    reconstructed = cores[0]
+
+    for core in cores[1:]:
+        reconstructed = torch.einsum(
+            "...a,aib->...ib",
+            reconstructed,
+            core,
+        )
+
+    return (
+        reconstructed
+        .squeeze(0)
+        .squeeze(-1)
+        .reshape(-1)
+    )
+
+
+def tt_encode_dataset(
+    X: torch.Tensor,
+    rank: int = TT_RANK,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    encoded = []
+    fidelities = []
+
+    with torch.no_grad():
+        for x in X:
+            exact = normalize_state(x)
+
+            approximation = tt_svd_vector(
+                x,
+                max_rank=rank,
+            )
+
+            approximation = normalize_state(
+                approximation
+            )
+
+            fidelity = torch.abs(
+                torch.dot(
+                    exact,
+                    approximation,
+                )
+            ) ** 2
+
+            encoded.append(
+                approximation
+            )
+
+            fidelities.append(
+                fidelity
+            )
+
+    return (
+        torch.stack(encoded),
+        torch.stack(fidelities),
+    )
+
+
+# ============================================================
+# Differentiable quantum gates
+# ============================================================
+
+def rx(theta: torch.Tensor) -> torch.Tensor:
+    c = torch.cos(theta / 2)
+    s = torch.sin(theta / 2)
+
+    return torch.stack(
+        [
+            torch.stack([c, -1j * s]),
+            torch.stack([-1j * s, c]),
+        ]
+    ).to(COMPLEX)
+
+
+def ry(theta: torch.Tensor) -> torch.Tensor:
+    c = torch.cos(theta / 2)
+    s = torch.sin(theta / 2)
+
+    return torch.stack(
+        [
+            torch.stack([c, -s]),
+            torch.stack([s, c]),
+        ]
+    ).to(COMPLEX)
+
+
+def rz(theta: torch.Tensor) -> torch.Tensor:
+    a = torch.exp(-0.5j * theta)
+    b = torch.exp(0.5j * theta)
+    z = torch.zeros_like(a)
+
+    return torch.stack(
+        [
+            torch.stack([a, z]),
+            torch.stack([z, b]),
+        ]
+    ).to(COMPLEX)
+
+
+def apply_1q(
+    state: torch.Tensor,
+    gate: torch.Tensor,
+    wire: int,
+) -> torch.Tensor:
+    batch_size = state.shape[0]
+
+    psi = state.reshape(
+        batch_size,
+        *([2] * NUM_QUBITS),
+    )
+
+    axis = wire + 1
+
+    permutation = (
+        [0]
+        + [
+            i
+            for i in range(
+                1,
+                NUM_QUBITS + 1,
+            )
+            if i != axis
+        ]
+        + [axis]
+    )
+
+    psi = psi.permute(
+        *permutation
+    ).contiguous()
+
+    original_shape = psi.shape
+
+    psi = psi.reshape(
+        -1,
+        2,
+    )
+
+    psi = torch.einsum(
+        "bi,ji->bj",
+        psi,
+        gate,
+    )
+
+    psi = psi.reshape(
+        original_shape
+    )
+
+    inverse = np.argsort(
+        permutation
+    )
+
+    psi = psi.permute(
+        *inverse
+    ).contiguous()
+
+    return psi.reshape(
+        batch_size,
+        -1,
+    )
+
+
+def apply_cnot(
+    state: torch.Tensor,
+    control: int,
+    target: int,
+) -> torch.Tensor:
+    dim = 2 ** NUM_QUBITS
+
+    indices = torch.arange(
+        dim,
+        device=state.device,
+    )
+
+    control_bit = (
+        indices
+        >> (
+            NUM_QUBITS
+            - 1
+            - control
+        )
+    ) & 1
+
+    target_mask = (
+        1
+        << (
+            NUM_QUBITS
+            - 1
+            - target
+        )
+    )
+
+    mapped = torch.where(
+        control_bit.bool(),
+        indices ^ target_mask,
+        indices,
+    )
+
+    return state[:, mapped]
+
+
+def z_expectations(
+    state: torch.Tensor,
+) -> torch.Tensor:
+    probabilities = torch.abs(
+        state
+    ) ** 2
+
+    basis_indices = torch.arange(
+        2 ** NUM_QUBITS,
+        device=state.device,
+    )
+
+    outputs = []
+
+    for qubit in range(
+        NUM_QUBITS
+    ):
+        bit = (
+            basis_indices
+            >> (
+                NUM_QUBITS
+                - 1
+                - qubit
+            )
+        ) & 1
+
+        sign = (
+            1.0
+            - 2.0
+            * bit.float()
+        )
+
+        expectation = torch.sum(
+            probabilities
+            * sign.unsqueeze(0),
+            dim=1,
+        )
+
+        outputs.append(
+            expectation
+        )
+
+    return torch.stack(
+        outputs,
+        dim=1,
+    )
+
+
+# ============================================================
+# Architecture representation
+# ============================================================
+
+@dataclass
+class Architecture:
+    depth: int
+    patterns: Tuple[str, ...]
+
+
+def edges_for_pattern(
+    pattern: str,
+) -> List[Tuple[int, int]]:
+    if pattern == "ring":
+        return [
+            (
+                q,
+                (q + 1) % NUM_QUBITS,
+            )
+            for q in range(
+                NUM_QUBITS
+            )
+        ]
+
+    if pattern == "linear":
+        return [
+            (q, q + 1)
+            for q in range(
+                NUM_QUBITS - 1
+            )
+        ]
+
+    if pattern == "brick_even":
+        return [
+            (q, q + 1)
+            for q in range(
+                0,
+                NUM_QUBITS - 1,
+                2,
+            )
+        ]
+
+    if pattern == "brick_odd":
+        edges = [
+            (q, q + 1)
+            for q in range(
+                1,
+                NUM_QUBITS - 1,
+                2,
+            )
+        ]
+
+        edges.append(
+            (
+                NUM_QUBITS - 1,
+                0,
+            )
+        )
+
+        return edges
+
+    raise ValueError(
+        f"Unknown entangling pattern: {pattern}"
+    )
+
+
+def architecture_stats(
+    architecture: Architecture,
+) -> Dict[str, int]:
+    n1 = (
+        architecture.depth
+        * NUM_QUBITS
+        * 3
+    )
+
+    n2 = sum(
+        len(
+            edges_for_pattern(
+                pattern
+            )
+        )
+        for pattern in architecture.patterns
+    )
+
+    return {
+        "depth": architecture.depth,
+        "n1": n1,
+        "n2": n2,
     }
-    rows.append(row)
 
-def print_method_table(method: str, rows_df: pd.DataFrame):
-    dfm = rows_df[rows_df["method"] == method].sort_values("task")
-    if dfm.empty: return
-    mean_std = dfm[["acc","bacc","f1","reward"]].agg(["mean","std"])
-    print("\n" + "="*70)
-    print(f"{method.upper():^70}")
-    print("="*70)
-    print(dfm[["task","acc","bacc","f1","reward","cz_frac","tn","fp","fn","tp"]].to_string(
-        index=False,
-        formatters={
-            "acc":"{:.3f}".format,"bacc":"{:.3f}".format,"f1":"{:.3f}".format,
-            "reward":(lambda x: "" if np.isnan(x) else f"{x:.4f}"),
-            "cz_frac":"{:.2f}".format
-        })
+
+def naive_architecture() -> Architecture:
+    depth = max(
+        DEPTH_CHOICES
     )
-    print("-"*70)
-    rmean = mean_std.loc['mean','reward'] if 'reward' in mean_std.columns else np.nan
-    rstd  = mean_std.loc['std','reward']  if 'reward' in mean_std.columns else np.nan
-    if method == "naive-vqc":
-        print(f" mean  | acc={mean_std.loc['mean','acc']:.3f}±{mean_std.loc['std','acc']:.3f} "
-              f"| bAcc={mean_std.loc['mean','bacc']:.3f}±{mean_std.loc['std','bacc']:.3f} "
-              f"| F1={mean_std.loc['mean','f1']:.3f}±{mean_std.loc['std','f1']:.3f}")
-    else:
-        print(f" mean  | acc={mean_std.loc['mean','acc']:.3f}±{mean_std.loc['std','acc']:.3f} "
-              f"| bAcc={mean_std.loc['mean','bacc']:.3f}±{mean_std.loc['std','bacc']:.3f} "
-              f"| F1={mean_std.loc['mean','f1']:.3f}±{mean_std.loc['std','f1']:.3f} "
-              f"| Rwd={rmean:.4f}±{rstd:.4f}")
 
-def export_csv(rows_df: pd.DataFrame, suffix: str = ""):
-    rows_df.sort_values(["method","task"]).to_csv(f"finance_task_results{suffix}.csv", index=False)
-    summary = rows_df.groupby("method")[["acc","bacc","f1","reward","cz_frac"]].agg(["mean","std"])
-    summary.columns = [f"{a}_{b}" for a,b in summary.columns]
-    summary.reset_index().to_csv(f"finance_task_summary{suffix}.csv", index=False)
-    print(f"\nSaved CSVs: finance_task_results{suffix}.csv and finance_task_summary{suffix}.csv")
+    return Architecture(
+        depth=depth,
+        patterns=tuple(
+            ["ring"] * depth
+        ),
+    )
 
-# ========================= Main =========================
-def main():
-    parser = argparse.ArgumentParser(description="CL-QAS Finance (256D -> TT(4,16,4)->(3,2,2)=12) with Noise")
-    parser.add_argument("--csv", nargs="*", default=[], help="CSV files (Close/Adj Close); if none, uses synthetic")
-    parser.add_argument("--tasks", type=int, default=8)
-    parser.add_argument("--lookback", type=int, default=32, help="window length for 256-D stack (must be 32)")
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--seed", type=int, default=1234)
-    # Noise
-    parser.add_argument("--p1", type=float, default=0.00, help="single-qubit depolarizing prob")
-    parser.add_argument("--p2", type=float, default=0.00, help="two-qubit Pauli error prob")
-    parser.add_argument("--pro", type=float, default=0.00, help="readout bit-flip prob")
-    parser.add_argument("--suffix", type=str, default="", help="suffix for output CSV names")
+
+# ============================================================
+# VQC
+# ============================================================
+
+class VQC(nn.Module):
+    def __init__(
+        self,
+        architecture: Architecture,
+    ):
+        super().__init__()
+
+        self.architecture = architecture
+
+        self.theta = nn.Parameter(
+            0.05
+            * torch.randn(
+                architecture.depth,
+                NUM_QUBITS,
+                3,
+            )
+        )
+
+    def forward(
+        self,
+        amplitudes: torch.Tensor,
+    ) -> torch.Tensor:
+        state = amplitudes.to(
+            DEVICE,
+            dtype=COMPLEX,
+        )
+
+        for layer in range(
+            self.architecture.depth
+        ):
+            for qubit in range(
+                NUM_QUBITS
+            ):
+                state = apply_1q(
+                    state,
+                    rx(
+                        self.theta[
+                            layer,
+                            qubit,
+                            0,
+                        ]
+                    ),
+                    qubit,
+                )
+
+                state = apply_1q(
+                    state,
+                    ry(
+                        self.theta[
+                            layer,
+                            qubit,
+                            1,
+                        ]
+                    ),
+                    qubit,
+                )
+
+                state = apply_1q(
+                    state,
+                    rz(
+                        self.theta[
+                            layer,
+                            qubit,
+                            2,
+                        ]
+                    ),
+                    qubit,
+                )
+
+            pattern = (
+                self.architecture.patterns[
+                    layer
+                ]
+            )
+
+            for control, target in edges_for_pattern(
+                pattern
+            ):
+                state = apply_cnot(
+                    state,
+                    control,
+                    target,
+                )
+
+        observables = z_expectations(
+            state
+        )
+
+        return observables[
+            :,
+            :NUM_CLASSES,
+        ]
+
+
+# ============================================================
+# Transformer architecture policy
+# ============================================================
+
+class QASPolicy(nn.Module):
+    def __init__(
+        self,
+        feature_dim: int = INPUT_DIM,
+        d_model: int = 64,
+        nhead: int = 8,
+        num_layers: int = 2,
+    ):
+        super().__init__()
+
+        max_depth = max(
+            DEPTH_CHOICES
+        )
+
+        self.feature_proj = nn.Linear(
+            feature_dim,
+            d_model,
+        )
+
+        self.layer_tokens = nn.Parameter(
+            0.02
+            * torch.randn(
+                1,
+                max_depth,
+                d_model,
+            )
+        )
+
+        encoder_layer = (
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=128,
+                dropout=0.1,
+                batch_first=True,
+            )
+        )
+
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+        self.depth_head = nn.Linear(
+            d_model,
+            len(DEPTH_CHOICES),
+        )
+
+        self.pattern_head = nn.Linear(
+            d_model,
+            len(ENT_PATTERNS),
+        )
+
+        self._initialize_policy()
+
+    def _initialize_policy(
+        self,
+    ) -> None:
+        with torch.no_grad():
+            self.depth_head.bias.zero_()
+            self.depth_head.bias[-1] = 0.4
+
+            self.pattern_head.bias.zero_()
+
+            ring_index = ENT_PATTERNS.index(
+                "ring"
+            )
+
+            self.pattern_head.bias[
+                ring_index
+            ] = 0.4
+
+    def forward(
+        self,
+        context: torch.Tensor,
+    ):
+        task_embedding = (
+            self.feature_proj(
+                context
+            )
+            .mean(
+                dim=0,
+                keepdim=True,
+            )
+        )
+
+        hidden = (
+            self.layer_tokens
+            + task_embedding.unsqueeze(1)
+        )
+
+        hidden = self.encoder(
+            hidden
+        )
+
+        pooled = hidden.mean(
+            dim=1
+        )
+
+        depth_logits = (
+            self.depth_head(
+                pooled
+            )
+            .squeeze(0)
+        )
+
+        pattern_logits = (
+            self.pattern_head(
+                hidden
+            )
+            .squeeze(0)
+        )
+
+        return (
+            depth_logits,
+            pattern_logits,
+        )
+
+
+# ============================================================
+# Architecture sampling
+# ============================================================
+
+@dataclass
+class PolicySample:
+    architecture: Architecture
+    log_prob: torch.Tensor
+    entropy: torch.Tensor
+
+
+def sample_architecture(
+    policy: QASPolicy,
+    context: torch.Tensor,
+) -> PolicySample:
+    (
+        depth_logits,
+        pattern_logits,
+    ) = policy(
+        context
+    )
+
+    depth_distribution = (
+        torch.distributions.Categorical(
+            logits=depth_logits
+        )
+    )
+
+    depth_index = (
+        depth_distribution.sample()
+    )
+
+    depth = DEPTH_CHOICES[
+        int(
+            depth_index.item()
+        )
+    ]
+
+    log_probability = (
+        depth_distribution.log_prob(
+            depth_index
+        )
+    )
+
+    entropy = (
+        depth_distribution.entropy()
+    )
+
+    patterns = []
+
+    for layer in range(
+        depth
+    ):
+        pattern_distribution = (
+            torch.distributions.Categorical(
+                logits=pattern_logits[
+                    layer
+                ]
+            )
+        )
+
+        pattern_index = (
+            pattern_distribution.sample()
+        )
+
+        patterns.append(
+            ENT_PATTERNS[
+                int(
+                    pattern_index.item()
+                )
+            ]
+        )
+
+        log_probability += (
+            pattern_distribution.log_prob(
+                pattern_index
+            )
+        )
+
+        entropy += (
+            pattern_distribution.entropy()
+        )
+
+    entropy /= (
+        depth + 1
+    )
+
+    return PolicySample(
+        architecture=Architecture(
+            depth=depth,
+            patterns=tuple(
+                patterns
+            ),
+        ),
+        log_prob=log_probability,
+        entropy=entropy,
+    )
+
+
+def greedy_architecture(
+    policy: QASPolicy,
+    context: torch.Tensor,
+) -> Architecture:
+    with torch.no_grad():
+        (
+            depth_logits,
+            pattern_logits,
+        ) = policy(
+            context
+        )
+
+        depth_index = int(
+            depth_logits.argmax().item()
+        )
+
+        depth = DEPTH_CHOICES[
+            depth_index
+        ]
+
+        patterns = []
+
+        for layer in range(
+            depth
+        ):
+            pattern_index = int(
+                pattern_logits[
+                    layer
+                ]
+                .argmax()
+                .item()
+            )
+
+            patterns.append(
+                ENT_PATTERNS[
+                    pattern_index
+                ]
+            )
+
+    return Architecture(
+        depth=depth,
+        patterns=tuple(
+            patterns
+        ),
+    )
+
+
+# ============================================================
+# EWC
+# ============================================================
+
+@dataclass
+class EWCState:
+    means: Dict[str, torch.Tensor]
+    fisher: Dict[str, torch.Tensor]
+
+
+def estimate_fisher(
+    policy: QASPolicy,
+    context: torch.Tensor,
+    num_samples: int = 24,
+) -> EWCState:
+    fisher = {
+        name: torch.zeros_like(
+            parameter
+        )
+        for name, parameter
+        in policy.named_parameters()
+        if parameter.requires_grad
+    }
+
+    policy.train()
+
+    for _ in range(
+        num_samples
+    ):
+        policy.zero_grad(
+            set_to_none=True
+        )
+
+        sample = sample_architecture(
+            policy,
+            context,
+        )
+
+        (
+            -sample.log_prob
+        ).backward()
+
+        for name, parameter in (
+            policy.named_parameters()
+        ):
+            if parameter.grad is not None:
+                fisher[name] += (
+                    parameter.grad.detach()
+                    ** 2
+                ) / num_samples
+
+    means = {
+        name: parameter.detach().clone()
+        for name, parameter
+        in policy.named_parameters()
+        if parameter.requires_grad
+    }
+
+    return EWCState(
+        means=means,
+        fisher=fisher,
+    )
+
+
+def ewc_penalty(
+    policy: QASPolicy,
+    state: Optional[EWCState],
+) -> torch.Tensor:
+    if state is None:
+        return torch.tensor(
+            0.0,
+            device=DEVICE,
+        )
+
+    penalty = torch.tensor(
+        0.0,
+        device=DEVICE,
+    )
+
+    for name, parameter in (
+        policy.named_parameters()
+    ):
+        if name not in state.fisher:
+            continue
+
+        penalty += torch.sum(
+            state.fisher[name]
+            * (
+                parameter
+                - state.means[name]
+            ) ** 2
+        )
+
+    return 0.5 * penalty
+
+
+# ============================================================
+# KL(pi_phi || pi_ref)
+# ============================================================
+
+def categorical_kl(
+    current_logits: torch.Tensor,
+    reference_logits: torch.Tensor,
+) -> torch.Tensor:
+    probability = torch.softmax(
+        current_logits,
+        dim=-1,
+    )
+
+    log_probability = torch.log_softmax(
+        current_logits,
+        dim=-1,
+    )
+
+    log_reference = torch.log_softmax(
+        reference_logits,
+        dim=-1,
+    )
+
+    return torch.sum(
+        probability
+        * (
+            log_probability
+            - log_reference
+        ),
+        dim=-1,
+    )
+
+
+def policy_kl(
+    policy: QASPolicy,
+    reference_policy: Optional[QASPolicy],
+    context: torch.Tensor,
+) -> torch.Tensor:
+    if reference_policy is None:
+        return torch.tensor(
+            0.0,
+            device=DEVICE,
+        )
+
+    (
+        depth_logits,
+        pattern_logits,
+    ) = policy(
+        context
+    )
+
+    with torch.no_grad():
+        (
+            reference_depth,
+            reference_pattern,
+        ) = reference_policy(
+            context
+        )
+
+    depth_kl = categorical_kl(
+        depth_logits,
+        reference_depth,
+    )
+
+    pattern_kl = (
+        categorical_kl(
+            pattern_logits,
+            reference_pattern,
+        )
+        .mean()
+    )
+
+    return (
+        depth_kl
+        + pattern_kl
+    )
+
+
+# ============================================================
+# Loss and metrics
+# ============================================================
+
+def make_class_weighted_ce(
+    y_train: torch.Tensor,
+) -> nn.Module:
+    counts = torch.bincount(
+        y_train,
+        minlength=2,
+    ).float()
+
+    weights = (
+        counts.sum()
+        / (
+            2.0
+            * counts.clamp_min(1)
+        )
+    )
+
+    weights = torch.clamp(
+        weights,
+        max=4.0,
+    )
+
+    return nn.CrossEntropyLoss(
+        weight=weights.to(
+            DEVICE
+        )
+    )
+
+
+def evaluate(
+    model: nn.Module,
+    X: torch.Tensor,
+    y: torch.Tensor,
+) -> Dict[str, float]:
+    model.eval()
+
+    truth = []
+    prediction = []
+
+    with torch.no_grad():
+        for start in range(
+            0,
+            len(X),
+            BATCH_SIZE,
+        ):
+            xb = X[
+                start:start + BATCH_SIZE
+            ].to(
+                DEVICE
+            )
+
+            logits = model(
+                xb
+            )
+
+            pred = (
+                logits
+                .argmax(
+                    dim=1
+                )
+                .cpu()
+            )
+
+            prediction.extend(
+                pred.tolist()
+            )
+
+            truth.extend(
+                y[
+                    start:start + BATCH_SIZE
+                ].tolist()
+            )
+
+    return {
+        "acc": accuracy_score(
+            truth,
+            prediction,
+        ),
+        "bAcc": balanced_accuracy_score(
+            truth,
+            prediction,
+        ),
+        "F1": f1_score(
+            truth,
+            prediction,
+            zero_division=0,
+        ),
+    }
+
+
+# ============================================================
+# Inner-loop VQC optimization
+# ============================================================
+
+def train_vqc(
+    architecture: Architecture,
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    epochs: int,
+    lr: float = VQC_LR,
+    initial_state: Optional[
+        Dict[str, torch.Tensor]
+    ] = None,
+) -> VQC:
+    model = VQC(
+        architecture
+    ).to(
+        DEVICE
+    )
+
+    if initial_state is not None:
+        try:
+            model.load_state_dict(
+                initial_state
+            )
+        except RuntimeError:
+            pass
+
+    criterion = make_class_weighted_ce(
+        y_train
+    )
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    best_loss = np.inf
+    best_state = None
+
+    for _ in range(
+        epochs
+    ):
+        model.train()
+
+        permutation = torch.randperm(
+            len(X_train)
+        )
+
+        total_loss = 0.0
+
+        for start in range(
+            0,
+            len(X_train),
+            BATCH_SIZE,
+        ):
+            ids = permutation[
+                start:start + BATCH_SIZE
+            ]
+
+            xb = X_train[
+                ids
+            ].to(
+                DEVICE
+            )
+
+            yb = y_train[
+                ids
+            ].to(
+                DEVICE
+            )
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            logits = model(
+                xb
+            )
+
+            loss = criterion(
+                logits,
+                yb,
+            )
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                5.0,
+            )
+
+            optimizer.step()
+
+            total_loss += (
+                loss.item()
+                * len(ids)
+            )
+
+        epoch_loss = (
+            total_loss
+            / len(X_train)
+        )
+
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            best_state = copy.deepcopy(
+                model.state_dict()
+            )
+
+    if best_state is not None:
+        model.load_state_dict(
+            best_state
+        )
+
+    return model
+
+
+# ============================================================
+# Reward
+# ============================================================
+
+def predictive_score(
+    metrics: Dict[str, float],
+) -> float:
+    return (
+        0.70
+        * metrics["bAcc"]
+        + 0.30
+        * metrics["F1"]
+    )
+
+
+def hardware_cost(
+    architecture: Architecture,
+) -> float:
+    stats = architecture_stats(
+        architecture
+    )
+
+    reference_n2 = (
+        max(
+            DEPTH_CHOICES
+        )
+        * NUM_QUBITS
+    )
+
+    return (
+        stats["n2"]
+        / reference_n2
+    )
+
+
+def architecture_reward(
+    metrics: Dict[str, float],
+    architecture: Architecture,
+) -> float:
+    return (
+        predictive_score(
+            metrics
+        )
+        - LAMBDA_HW
+        * hardware_cost(
+            architecture
+        )
+    )
+
+
+# ============================================================
+# Candidate evaluation
+# ============================================================
+
+@dataclass
+class CandidateResult:
+    architecture: Architecture
+    reward: float
+    val_metrics: Dict[str, float]
+    state_dict: Dict[str, torch.Tensor]
+    log_prob: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
+
+
+def evaluate_candidate(
+    architecture: Architecture,
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    X_val: torch.Tensor,
+    y_val: torch.Tensor,
+) -> CandidateResult:
+    model = train_vqc(
+        architecture,
+        X_train,
+        y_train,
+        epochs=SEARCH_INNER_EPOCHS,
+    )
+
+    metrics = evaluate(
+        model,
+        X_val,
+        y_val,
+    )
+
+    reward = architecture_reward(
+        metrics,
+        architecture,
+    )
+
+    return CandidateResult(
+        architecture=architecture,
+        reward=reward,
+        val_metrics=metrics,
+        state_dict=copy.deepcopy(
+            model.state_dict()
+        ),
+    )
+
+
+# ============================================================
+# Bi-loop QAS
+# ============================================================
+
+def search_task(
+    policy: QASPolicy,
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    X_val: torch.Tensor,
+    y_val: torch.Tensor,
+    *,
+    ewc_state: Optional[EWCState] = None,
+    reference_policy: Optional[QASPolicy] = None,
+    use_cl: bool = False,
+):
+    policy_optimizer = torch.optim.Adam(
+        policy.parameters(),
+        lr=POLICY_LR,
+    )
+
+    context = X_train[
+        :min(
+            192,
+            len(X_train),
+        )
+    ].to(
+        DEVICE
+    )
+
+    reward_baseline = None
+
+    anchor = evaluate_candidate(
+        naive_architecture(),
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+    )
+
+    best_candidate = anchor
+
+    anchor_stats = architecture_stats(
+        anchor.architecture
+    )
+
+    print(
+        "      Anchor ring | "
+        f"R={anchor.reward:.4f} | "
+        f"bAcc={anchor.val_metrics['bAcc']:.4f} | "
+        f"F1={anchor.val_metrics['F1']:.4f} | "
+        f"G2={anchor_stats['n2']}"
+    )
+
+    for outer in range(
+        SEARCH_STEPS
+    ):
+        candidate_results = []
+
+        for _ in range(
+            CANDIDATES_PER_STEP
+        ):
+            policy_sample = sample_architecture(
+                policy,
+                context,
+            )
+
+            result = evaluate_candidate(
+                policy_sample.architecture,
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+            )
+
+            result.log_prob = (
+                policy_sample.log_prob
+            )
+
+            result.entropy = (
+                policy_sample.entropy
+            )
+
+            candidate_results.append(
+                result
+            )
+
+            if (
+                result.reward
+                > best_candidate.reward
+            ):
+                best_candidate = result
+
+        rewards = np.asarray(
+            [
+                result.reward
+                for result
+                in candidate_results
+            ],
+            dtype=np.float32,
+        )
+
+        mean_reward = float(
+            rewards.mean()
+        )
+
+        if reward_baseline is None:
+            reward_baseline = mean_reward
+
+        advantages = torch.tensor(
+            rewards - reward_baseline,
+            dtype=REAL,
+            device=DEVICE,
+        )
+
+        if (
+            advantages.numel() > 1
+            and advantages.std() > 1e-6
+        ):
+            advantages = (
+                advantages
+                - advantages.mean()
+            ) / (
+                advantages.std()
+                + 1e-6
+            )
+
+        log_probs = torch.stack(
+            [
+                result.log_prob
+                for result
+                in candidate_results
+            ]
+        )
+
+        entropy = torch.stack(
+            [
+                result.entropy
+                for result
+                in candidate_results
+            ]
+        ).mean()
+
+        reinforce_loss = -torch.mean(
+            advantages.detach()
+            * log_probs
+        )
+
+        L_ewc = (
+            ewc_penalty(
+                policy,
+                ewc_state,
+            )
+            if (
+                use_cl
+                and ewc_state is not None
+            )
+            else torch.tensor(
+                0.0,
+                device=DEVICE,
+            )
+        )
+
+        L_kl = (
+            policy_kl(
+                policy,
+                reference_policy,
+                context,
+            )
+            if (
+                use_cl
+                and reference_policy is not None
+            )
+            else torch.tensor(
+                0.0,
+                device=DEVICE,
+            )
+        )
+
+        policy_loss = (
+            reinforce_loss
+            + MU_EWC * L_ewc
+            + ETA_KL * L_kl
+            - ENTROPY_COEF * entropy
+        )
+
+        policy_optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        policy_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            policy.parameters(),
+            1.0,
+        )
+
+        policy_optimizer.step()
+
+        reward_baseline = (
+            0.9 * reward_baseline
+            + 0.1 * mean_reward
+        )
+
+        if (
+            outer == 0
+            or (outer + 1) % 5 == 0
+        ):
+            best_stats = architecture_stats(
+                best_candidate.architecture
+            )
+
+            print(
+                f"      outer={outer + 1:02d} | "
+                f"meanR={mean_reward:.4f} | "
+                f"bestR={best_candidate.reward:.4f} | "
+                f"G2={best_stats['n2']} | "
+                f"EWC={float(L_ewc.detach()):.6f} | "
+                f"KL={float(L_kl.detach()):.6f}"
+            )
+
+    greedy_arch = greedy_architecture(
+        policy,
+        context,
+    )
+
+    greedy_result = evaluate_candidate(
+        greedy_arch,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+    )
+
+    if (
+        greedy_result.reward
+        > best_candidate.reward
+    ):
+        best_candidate = greedy_result
+
+    return (
+        best_candidate,
+        context,
+    )
+
+
+# ============================================================
+# Final test evaluation
+# ============================================================
+
+def final_evaluation(
+    candidate: CandidateResult,
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    X_test: torch.Tensor,
+    y_test: torch.Tensor,
+) -> Dict:
+    model = train_vqc(
+        candidate.architecture,
+        X_train,
+        y_train,
+        epochs=FINAL_EPOCHS,
+        initial_state=candidate.state_dict,
+    )
+
+    metrics = evaluate(
+        model,
+        X_test,
+        y_test,
+    )
+
+    stats = architecture_stats(
+        candidate.architecture
+    )
+
+    return {
+        **metrics,
+        "reward": candidate.reward,
+        "depth": stats["depth"],
+        "n1": stats["n1"],
+        "n2": stats["n2"],
+        "patterns": "|".join(
+            candidate.architecture.patterns
+        ),
+    }
+
+
+# ============================================================
+# Prepare task without leakage
+# ============================================================
+
+def prepare_task(
+    X_raw: torch.Tensor,
+    y: torch.Tensor,
+):
+    (
+        X_train_raw,
+        y_train,
+        X_val_raw,
+        y_val,
+        X_test_raw,
+        y_test,
+    ) = time_split(
+        X_raw,
+        y,
+    )
+
+    scaler = fit_robust_scaler(
+        X_train_raw
+    )
+
+    X_train_scaled = transform_robust(
+        X_train_raw,
+        scaler,
+    )
+
+    X_val_scaled = transform_robust(
+        X_val_raw,
+        scaler,
+    )
+
+    X_test_scaled = transform_robust(
+        X_test_raw,
+        scaler,
+    )
+
+    X_train, F_train = tt_encode_dataset(
+        X_train_scaled,
+        rank=TT_RANK,
+    )
+
+    X_val, F_val = tt_encode_dataset(
+        X_val_scaled,
+        rank=TT_RANK,
+    )
+
+    X_test, F_test = tt_encode_dataset(
+        X_test_scaled,
+        rank=TT_RANK,
+    )
+
+    fidelity = torch.cat(
+        [
+            F_train,
+            F_val,
+            F_test,
+        ]
+    )
+
+    return (
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
+        float(
+            fidelity.mean()
+        ),
+    )
+
+
+# ============================================================
+# Sequential experiment
+# ============================================================
+
+def run_seed(
+    tasks,
+    seed: int,
+) -> List[Dict]:
+    set_seed(seed)
+
+    policy_nocl = (
+        QASPolicy()
+        .to(DEVICE)
+    )
+
+    policy_cl = (
+        QASPolicy()
+        .to(DEVICE)
+    )
+
+    ewc_state = None
+    reference_policy = None
+
+    results = []
+
+    for task_id, (
+        X_raw,
+        y,
+    ) in enumerate(
+        tasks,
+        start=1,
+    ):
+        print(
+            "\n"
+            + "=" * 78
+        )
+
+        print(
+            f"Seed {seed} | "
+            f"Financial Task {task_id}"
+        )
+
+        (
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            X_test,
+            y_test,
+            mean_fidelity,
+        ) = prepare_task(
+            X_raw,
+            y,
+        )
+
+        print(
+            f"  TT rank={TT_RANK}, "
+            f"mean fidelity="
+            f"{mean_fidelity:.6f}"
+        )
+
+        # ----------------------------------------------------
+        # Naive-VQC
+        # ----------------------------------------------------
+
+        print("\n  [Naive-VQC]")
+
+        naive_arch = naive_architecture()
+
+        naive_model = train_vqc(
+            naive_arch,
+            X_train,
+            y_train,
+            epochs=FINAL_EPOCHS,
+        )
+
+        naive_metrics = evaluate(
+            naive_model,
+            X_test,
+            y_test,
+        )
+
+        naive_stats = architecture_stats(
+            naive_arch
+        )
+
+        results.append(
+            {
+                "seed": seed,
+                "task": task_id,
+                "method": "Naive-VQC",
+                **naive_metrics,
+                "reward": np.nan,
+                "depth": naive_stats["depth"],
+                "n1": naive_stats["n1"],
+                "n2": naive_stats["n2"],
+                "patterns": "|".join(
+                    naive_arch.patterns
+                ),
+                "tt_fidelity": mean_fidelity,
+            }
+        )
+
+        print(
+            f"      Test | "
+            f"acc={naive_metrics['acc']:.4f} | "
+            f"bAcc={naive_metrics['bAcc']:.4f} | "
+            f"F1={naive_metrics['F1']:.4f} | "
+            f"G2={naive_stats['n2']}"
+        )
+
+        # ----------------------------------------------------
+        # QAS-No-CL
+        # ----------------------------------------------------
+
+        print("\n  [QAS-No-CL]")
+
+        qas_candidate, _ = search_task(
+            policy_nocl,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            use_cl=False,
+        )
+
+        qas_result = final_evaluation(
+            qas_candidate,
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+        )
+
+        results.append(
+            {
+                "seed": seed,
+                "task": task_id,
+                "method": "QAS-No-CL",
+                **qas_result,
+                "tt_fidelity": mean_fidelity,
+            }
+        )
+
+        print(
+            f"      Test | "
+            f"acc={qas_result['acc']:.4f} | "
+            f"bAcc={qas_result['bAcc']:.4f} | "
+            f"F1={qas_result['F1']:.4f} | "
+            f"G2={qas_result['n2']}"
+        )
+
+        # ----------------------------------------------------
+        # CL-QAS
+        # ----------------------------------------------------
+
+        print("\n  [CL-QAS]")
+
+        cl_candidate, context = search_task(
+            policy_cl,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            ewc_state=ewc_state,
+            reference_policy=reference_policy,
+            use_cl=True,
+        )
+
+        cl_result = final_evaluation(
+            cl_candidate,
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+        )
+
+        results.append(
+            {
+                "seed": seed,
+                "task": task_id,
+                "method": "CL-QAS",
+                **cl_result,
+                "tt_fidelity": mean_fidelity,
+            }
+        )
+
+        print(
+            f"      Test | "
+            f"acc={cl_result['acc']:.4f} | "
+            f"bAcc={cl_result['bAcc']:.4f} | "
+            f"F1={cl_result['F1']:.4f} | "
+            f"G2={cl_result['n2']}"
+        )
+
+        ewc_state = estimate_fisher(
+            policy_cl,
+            context,
+        )
+
+        reference_policy = (
+            copy.deepcopy(
+                policy_cl
+            )
+            .eval()
+        )
+
+        for parameter in (
+            reference_policy.parameters()
+        ):
+            parameter.requires_grad_(
+                False
+            )
+
+    return results
+
+
+# ============================================================
+# Reporting
+# ============================================================
+
+def summarize_results(
+    results: List[Dict],
+) -> None:
+    print(
+        "\n"
+        + "=" * 82
+    )
+
+    print(
+        "OVERALL FINANCIAL PREDICTIVE PERFORMANCE"
+    )
+
+    print(
+        "=" * 82
+    )
+
+    methods = (
+        "Naive-VQC",
+        "QAS-No-CL",
+        "CL-QAS",
+    )
+
+    for method in methods:
+        rows = [
+            row
+            for row in results
+            if row["method"] == method
+        ]
+
+        print(
+            f"\n{method}"
+        )
+
+        for metric in (
+            "acc",
+            "bAcc",
+            "F1",
+            "n2",
+        ):
+            values = np.asarray(
+                [
+                    row[metric]
+                    for row in rows
+                ],
+                dtype=float,
+            )
+
+            print(
+                f"  {metric:>5}: "
+                f"{values.mean():.4f} "
+                f"± "
+                f"{values.std(ddof=1):.4f}"
+            )
+
+        if method != "Naive-VQC":
+            rewards = np.asarray(
+                [
+                    row["reward"]
+                    for row in rows
+                ],
+                dtype=float,
+            )
+
+            print(
+                f" reward: "
+                f"{rewards.mean():.4f} "
+                f"± "
+                f"{rewards.std(ddof=1):.4f}"
+            )
+
+    fidelity = np.asarray(
+        [
+            row["tt_fidelity"]
+            for row in results
+            if row["method"] == "CL-QAS"
+        ],
+        dtype=float,
+    )
+
+    print(
+        "\nTT representation fidelity: "
+        f"{fidelity.mean():.6f} "
+        f"± "
+        f"{fidelity.std(ddof=1):.6f}"
+    )
+
+
+# ============================================================
+# CSV export
+# ============================================================
+
+def save_results(
+    results: List[Dict],
+    path: str,
+) -> None:
+    fields = (
+        "seed",
+        "task",
+        "method",
+        "acc",
+        "bAcc",
+        "F1",
+        "reward",
+        "depth",
+        "n1",
+        "n2",
+        "patterns",
+        "tt_fidelity",
+    )
+
+    with open(
+        path,
+        "w",
+        newline="",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fields,
+        )
+
+        writer.writeheader()
+
+        for row in results:
+            writer.writerow(
+                {
+                    field: row.get(
+                        field,
+                        "",
+                    )
+                    for field in fields
+                }
+            )
+
+    print(
+        f"\nSaved results to:\n"
+        f"    {path}"
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Revised CL-QAS financial experiment."
+        )
+    )
+
+    parser.add_argument(
+        "--csv",
+        nargs="*",
+        default=[],
+        help=(
+            "Financial CSV files containing Close or Adj Close. "
+            "If no valid CSV is supplied, synthetic data are used."
+        ),
+    )
+
+    parser.add_argument(
+        "--tasks",
+        type=int,
+        default=8,
+    )
+
+    parser.add_argument(
+        "--horizon",
+        type=int,
+        default=1,
+        help=(
+            "Future prediction horizon."
+        ),
+    )
+
+    parser.add_argument(
+        "--min-per-task",
+        type=int,
+        default=400,
+    )
+
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help=(
+            "Run reduced search/training settings for debugging."
+        ),
+    )
+
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=(
+            "revised_finance_clqas_results.csv"
+        ),
+    )
+
     args = parser.parse_args()
 
-    if args.lookback != 32:
-        print("[WARN] For 256-D inputs this script expects lookback=32. Continuing anyway…")
+    global SEARCH_STEPS
+    global CANDIDATES_PER_STEP
+    global SEARCH_INNER_EPOCHS
+    global FINAL_EPOCHS
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    set_seed(args.seed)
+    if args.quick:
+        SEARCH_STEPS = 3
+        CANDIDATES_PER_STEP = 2
+        SEARCH_INNER_EPOCHS = 3
+        FINAL_EPOCHS = 10
 
-    NOISE = NoiseConfig(p_depol_1q=args.p1, p_error_2q=args.p2, p_readout=args.pro)
-    print(f"[Noise] 1q depol={NOISE.p1:.4%} | 2q err={NOISE.p2:.4%} | readout={NOISE.pro:.2%}")
+        seeds = (11,)
 
-    # Load prices
+        print(
+            "[Quick mode] Reduced search/training settings."
+        )
+    else:
+        seeds = DEFAULT_SEEDS
+
+    print(
+        f"Device: {DEVICE}"
+    )
+
+    # --------------------------------------------------------
+    # Load real financial data if provided
+    # --------------------------------------------------------
+
     closes = []
-    for p in args.csv:
-        if os.path.exists(p):
-            try:
-                closes.append(load_close_from_csv(p))
-            except Exception as e:
-                print(f"Warning: {p} skipped ({e})")
-    if not closes:
-        closes = [make_synthetic_close(n=6000, regimes=6, seed=777)]
-    close = np.concatenate(closes)
 
-    # Build tasks (256-D inputs)
-    tasks = build_finance_tasks(close, n_tasks=args.tasks, lookback=32, horizon=1, min_per_task=500)
-    print(f"Prepared {len(tasks)} tasks, input_dim={tasks[0][0].shape[1]} (expected 256)")
+    for path in args.csv:
+        if not os.path.exists(
+            path
+        ):
+            print(
+                f"[WARN] File not found: {path}"
+            )
+            continue
 
-    NUM_QUBITS = 12  # TT (3*2*2)
-    ALL_ROWS: List[Dict] = []
+        try:
+            close_i = load_close_from_csv(
+                path
+            )
 
-    # Baseline: Naive-VQC
-    print("\n================= Baseline: Naive-VQC =================")
-    res_vqc = []
-    for t_idx, (X, y) in enumerate(tasks, 1):
-        print(f"\n== Task {t_idx}")
-        res = run_naive_vqc_on_task(X, y, device=device, epochs=args.epochs, lr=2e-3, batch_size=128,
-                                    noise=NOISE, num_qubits=NUM_QUBITS)
-        res_vqc.append(res); accumulate_results(ALL_ROWS, "naive-vqc", t_idx, res)
+            closes.append(
+                close_i
+            )
 
-    # Baseline: QAS (no-CL)
-    print("\n================= Baseline: QAS (no-CL) =================")
-    policy_nc = QASPolicy(num_qubits=NUM_QUBITS, fea_dim=256, d_model=64, nhead=8).to(device)
-    res_qas_nc = []; rb_nc = RewardBaseline(beta=0.9)
-    for t_idx, (X, y) in enumerate(tasks, 1):
-        print(f"\n== Task {t_idx} | method=qas-no-cl")
-        res = run_qas_on_task(policy_nc, X, y, device=device, prev_ewc=None, use_cl=False,
-                              replay=None, reward_baseline=rb_nc, epochs=args.epochs, lr=2e-3,
-                              batch_size=128, noise=NOISE, num_qubits=NUM_QUBITS)
-        res_qas_nc.append(res); accumulate_results(ALL_ROWS, "qas-no-cl", t_idx, res)
+            print(
+                f"[INFO] Loaded {path} "
+                f"({len(close_i)} observations)"
+            )
 
-    # Proposed: CL-QAS
-    print("\n================= Proposed: CL-QAS =================")
-    policy_cl = QASPolicy(num_qubits=NUM_QUBITS, fea_dim=256, d_model=64, nhead=8).to(device)
-    replay = ReplayBuffer(per_class_cap=500)
-    res_cl = []; prev_ewc = None; rb_cl = RewardBaseline(beta=0.9)
-    for t_idx, (X, y) in enumerate(tasks, 1):
-        print(f"\n== Task {t_idx} | method=cl-qas")
-        res = run_qas_on_task(policy_cl, X, y, device=device, prev_ewc=prev_ewc, use_cl=True,
-                              replay=replay, reward_baseline=rb_cl, epochs=args.epochs, lr=2e-3,
-                              batch_size=128, noise=NOISE, num_qubits=NUM_QUBITS)
-        res_cl.append(res); accumulate_results(ALL_ROWS, "cl-qas", t_idx, res)
-        # refresh EWC on train window only
-        Xtr, ytr, _, _, _, _ = time_split(X, y, train_frac=0.8, val_frac=0.1)
-        tr_loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=128, shuffle=False)
-        prev_ewc = EWCLoss(policy_cl, tr_loader, device=device, lambda_ewc=50.0)
+        except Exception as exc:
+            print(
+                f"[WARN] Skip {path}: {exc}"
+            )
 
-    # Pretty print per method
-    df_all = pd.DataFrame(ALL_ROWS)
-    for method in ["naive-vqc", "qas-no-cl", "cl-qas"]:
-        print_method_table(method, df_all)
+    # --------------------------------------------------------
+    # Automatic synthetic fallback
+    # --------------------------------------------------------
 
-    # Summary across tasks
-    def summarize(arr, key):
-        vals = np.array([a[key] for a in arr], dtype=float)
-        return vals.mean(), vals.std()
+    if closes:
+        close = np.concatenate(
+            closes
+        )
 
-    print("\n================= Summary (Test Metrics across tasks) =================")
-    for name, arr in [("naive-vqc", res_vqc), ("qas-no-cl", res_qas_nc), ("cl-qas", res_cl)]:
-        acc_m, acc_s = summarize(arr, "acc")
-        b_m, b_s = summarize(arr, "bacc")
-        f1_m, f1_s = summarize(arr, "f1")
-        if name == "naive-vqc":
-            print(f"{name:10s}: acc={acc_m:.3f}±{acc_s:.3f} | bAcc={b_m:.3f}±{b_s:.3f} | F1={f1_m:.3f}±{f1_s:.3f}")
-        else:
-            rew = np.array([a['reward'] for a in arr], dtype=float)
-            print(f"{name:10s}: acc={acc_m:.3f}±{acc_s:.3f} | bAcc={b_m:.3f}±{b_s:.3f} | F1={f1_m:.3f}±{f1_s:.3f} | Reward={rew.mean():.4f}±{rew.std():.4f}")
+        print(
+            f"[INFO] Using real financial data: "
+            f"{len(close)} total observations."
+        )
 
-    # Export CSVs
-    suffix = f"_{args.suffix}" if args.suffix else ""
-    export_csv(df_all, suffix=suffix)
+    else:
+        print(
+            "[INFO] No valid CSV supplied. "
+            "Using synthetic financial data."
+        )
+
+        close = make_synthetic_close(
+            n=8000,
+            regimes=8,
+            seed=777,
+        )
+
+        print(
+            f"[INFO] Synthetic series generated: "
+            f"{len(close)} observations."
+        )
+
+    # --------------------------------------------------------
+    # Build sequential tasks
+    # --------------------------------------------------------
+
+    tasks = build_finance_tasks(
+        close,
+        n_tasks=args.tasks,
+        lookback=LOOKBACK,
+        horizon=args.horizon,
+        min_per_task=args.min_per_task,
+    )
+
+    if len(tasks) < 2:
+        raise RuntimeError(
+            "Too few valid financial tasks."
+        )
+
+    print(
+        f"\nPrepared {len(tasks)} "
+        f"sequential financial tasks."
+    )
+
+    # --------------------------------------------------------
+    # Run independent seeds
+    # --------------------------------------------------------
+
+    all_results: List[Dict] = []
+
+    for seed in seeds:
+        seed_results = run_seed(
+            tasks,
+            seed,
+        )
+
+        all_results.extend(
+            seed_results
+        )
+
+    # --------------------------------------------------------
+    # Report and save
+    # --------------------------------------------------------
+
+    summarize_results(
+        all_results
+    )
+
+    save_results(
+        all_results,
+        args.output,
+    )
+
 
 if __name__ == "__main__":
     main()
